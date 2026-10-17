@@ -1,0 +1,23 @@
+# AronaClient 运行依赖
+#
+# 生成依据：对项目全部 .py 做 AST 导入扫描，提取真实使用的第三方顶层模块
+#           （排除标准库与项目自身的 core / computer / config / ui）。
+#
+# 版本约束说明：
+#   下面的版本号是【本机实际安装并在阶段 A 基线测试中验证过的版本】。
+#   使用 >= 而非 == ，以便在保持已验证下限的同时接受安全的补丁更新。
+#   若要完全可复现的构建，请把 >= 改成 == 。
+
+PySide6>=6.11.2
+openai>=3.20.0
+PyAutoGUI>=0.9.54
+Pillow>=12.3.0
+opencv-python>=5.0.0.93
+numpy>=2.5.3
+keyring>=25.7.0
+python-dotenv>=1.2.3
+Markdown>=3.11
+SpeechRecognition>=3.17.0
+
+# 打包与安装（仅发布时需要，运行不需要）
+# pyinstaller>=6.22.3

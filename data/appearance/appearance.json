@@ -1,0 +1,16 @@
+{
+  "user_bubble_color": "#2d6fe2",
+  "ai_bubble_color": "#17243a",
+  "message_text_color": "#f2f6fd",
+  "user_text_color": "#ffffff",
+  "ai_text_color": "#f2f6fd",
+  "bubble_opacity": 52,
+  "bubble_radius": 0,
+  "chat_background_mode": "default",
+  "chat_background_color": "#0b0084",
+  "chat_background_image": "",
+  "chat_background_opacity": 100,
+  "bubble_background_image": "",
+  "desktop_transparent": true,
+  "desktop_background_alpha": 178
+}
