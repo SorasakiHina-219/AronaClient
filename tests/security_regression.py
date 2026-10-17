@@ -1,4 +1,4 @@
-﻿"""
+"""
 AronaClient 安全回归测试
 测试项目: P0 安全审计修复
 运行: python tests/security_regression.py
