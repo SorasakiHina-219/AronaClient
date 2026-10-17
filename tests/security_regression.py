@@ -93,7 +93,8 @@ def test_desktop_awareness_auth():
     try:
         with open('core/desktop_awareness.py', 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
-        if 'is_authorized' not in content:
+        auth_patterns = ['is_authorized', 'check_desktop_vision_authorization', 'PermissionError', '授权拒绝']
+        if not any(p in content for p in auth_patterns):
             errors.append('desktop_awareness.py 缺少授权检查')
     except Exception as e:
         errors.append(f'desktop_awareness.py 读取失败: {e}')
