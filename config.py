@@ -7,7 +7,7 @@ load_dotenv()
 
 
 # =========================
-# 榛樿閰嶇疆
+# 默认配置
 # =========================
 
 DEFAULT_PROVIDER = "deepseek"
@@ -42,7 +42,7 @@ OPENROUTER_API_KEY = os.getenv(
 
 
 # =========================
-# 妯″瀷
+# 模型
 # =========================
 
 DEEPSEEK_MODEL = os.getenv(
@@ -57,7 +57,7 @@ OPENROUTER_MODEL = os.getenv(
 
 
 # =========================
-# Arona 浜烘牸
+# Arona 人格
 # =========================
 
 SYSTEM_PROMPT = """你是 Arona。
