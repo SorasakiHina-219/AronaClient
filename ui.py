@@ -2305,6 +2305,10 @@ class SettingsDialog(QDialog):
             awareness_layout.addWidget(
                 self.awareness_enabled_checkbox
             )
+            # 连接信号：切换开关时立即启停感知引擎，无需等保存。
+            self.awareness_enabled_checkbox.toggled.connect(
+                self._on_awareness_toggled
+            )
 
             # 间隔设置
             interval_layout = QHBoxLayout()
@@ -8046,6 +8050,41 @@ class AronaUI(QMainWindow):
             self.desktop_awareness = None
             self._awareness_active = False
             self._awareness_init_done = False
+
+    def _on_awareness_toggled(self, checked: bool) -> None:
+        """
+        桌面自主感知开关切换回调。
+        开启时启动或恢复引擎，关闭时暂停引擎。
+        幂等：重复操作不会重复创建线程。
+        """
+        if checked:
+            # 开启：确保引擎在运行
+            if self.desktop_awareness is None:
+                # 从未初始化过，执行完整初始化
+                self._init_desktop_awareness()
+            elif self.desktop_awareness.is_stopped:
+                # 已停止（如 DV 曾关闭后重新开启），重新初始化
+                self._init_desktop_awareness()
+            elif self.desktop_awareness.is_paused:
+                # 已暂停，恢复
+                try:
+                    self.desktop_awareness.resume()
+                    self._awareness_active = True
+                    self._update_awareness_status_ui()
+                    logger.info("桌面感知：用户手动恢复")
+                except Exception as exc:
+                    logger.warning("桌面感知：恢复失败：%s", exc)
+            # else: 已在运行，无需操作
+        else:
+            # 关闭：暂停引擎（不销毁，保留状态以便恢复）
+            if self.desktop_awareness is not None and self.desktop_awareness.is_running:
+                try:
+                    self.desktop_awareness.pause()
+                    self._awareness_active = False
+                    self._update_awareness_status_ui()
+                    logger.info("桌面感知：用户手动暂停")
+                except Exception as exc:
+                    logger.warning("桌面感知：暂停失败：%s", exc)
 
     def refresh_avatar_widgets(
         self,

@@ -123,27 +123,20 @@ def is_desktop_vision_authorized():
 
 def _settle(seconds):
     """
-    让 Qt 处理事件，并留出时间让桌面真正重绘。
+    等待指定时间，让桌面有足够时间重绘。
 
-    只 sleep 不处理事件是不行的：
-    窗口的隐藏动作必须经过事件循环才会真正生效。
+    注意：此函数可能在 worker 线程中调用（桌面感知后台循环）。
+    不能调用 QGuiApplication.processEvents()，否则会在非主线程
+    处理事件队列，导致事件交叉和潜在的冻结。
+    窗口的 hide/show 本身会触发 OS 重绘事件，sleep 足以等待。
     """
 
     try:
 
-        deadline = time.monotonic() + max(0.0, float(seconds))
+        end = time.monotonic() + max(0.0, float(seconds))
 
-        while True:
-
-            QGuiApplication.processEvents()
-
-            if time.monotonic() >= deadline:
-
-                break
-
+        while time.monotonic() < end:
             time.sleep(0.02)
-
-        QGuiApplication.processEvents()
 
     except Exception:
 
@@ -634,11 +627,10 @@ class DesktopVision:
         未授权时【先拒绝、后返回】，不会读取任何桌面像素。
 
         线程安全：
-            Qt 6 允许在任意线程执行 GUI 操作（只要 QCoreApplication
-            的事件循环在运行）。本方法不强制路由到主线程——
-            手动截图路径在主线程调用，V1 感知路径在 worker 线程调用，
-            均可安全执行。window.hide/show、screen.grabWindow(0)
-            和 _settle() 中的 processEvents() 均在此线程上运行。
+            手动截图路径在主线程调用；V1 感知路径在 worker 线程调用。
+            window.hide/show、screen.grabWindow(0) 在主线程环境下安全；
+            在 worker 线程中调用时，_settle() 仅做时间等待，不触碰
+            Qt 事件循环，避免跨线程事件交叉。
         """
 
         # ---------------- 门禁：必须在任何桌面读取之前 ----------------

@@ -430,6 +430,7 @@ class _AwarenessWorker(QObject):
                     "如果画面没有明显变化，返回 '无明显变化'。"
                     "只描述事实，不推测意图。"
                 ),
+                timeout=ANALYSIS_TIMEOUT_SECONDS,  # 防止网络超时阻塞 worker
                 user_confirmed=True,  # 内部使用，不对外暴露
             )
 
