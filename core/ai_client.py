@@ -1970,6 +1970,7 @@ class AIClient:
         self,
         message,
         attachments=None,
+        save_to_session=True,
     ):
 
         if not self.client:
@@ -2066,13 +2067,15 @@ class AIClient:
                 "content": final_text,
             }
 
-        self.messages.append(
-            request_message
-        )
+        if save_to_session:
 
-        self.memory.auto_remember(
-            message or ""
-        )
+            self.messages.append(
+                request_message
+            )
+
+            self.memory.auto_remember(
+                message or ""
+            )
 
         request_model = (
             self._select_model(
@@ -2080,10 +2083,19 @@ class AIClient:
             )
         )
 
+        # 使用临时消息列表发送请求，避免感知请求污染会话上下文。
+        # save_to_session=True 时使用 self.messages（含历史上下文）；
+        # save_to_session=False 时使用仅含本次请求的临时列表。
+        context_messages = (
+            self.messages + [request_message]
+            if save_to_session
+            else [request_message]
+        )
+
         response = (
             self.client.chat.completions.create(
                 model=request_model,
-                messages=self.messages,
+                messages=context_messages,
             )
         )
 
@@ -2093,32 +2105,34 @@ class AIClient:
             or ""
         )
 
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
+        if save_to_session:
 
-        if self.current_session:
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            )
 
-            if (
-                self.current_session.get("title")
-                in (
-                    "",
-                    None,
-                    "新对话",
-                )
-                and message
-            ):
+            if self.current_session:
 
-                self.current_session[
-                    "title"
-                ] = self._make_session_title(
-                    message
-                )
+                if (
+                    self.current_session.get("title")
+                    in (
+                        "",
+                        None,
+                        "新对话",
+                    )
+                    and message
+                ):
 
-            self._save_current_session()
+                    self.current_session[
+                        "title"
+                    ] = self._make_session_title(
+                        message
+                    )
+
+                self._save_current_session()
 
         return answer
 

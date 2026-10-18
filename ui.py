@@ -706,7 +706,10 @@ class AwarenessReplyWorker(QObject):
                     self.awareness_description
                 )
             )
-            result = self.ai_client.send_message(message)
+            result = self.ai_client.send_message(
+                message,
+                save_to_session=False,
+            )
             self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -720,6 +723,7 @@ class SettingsDialog(QDialog):
 
     saved = Signal()
     appearance_saved = Signal(bool, int)
+    awareness_toggled = Signal(bool)
 
     def __init__(
         self,
@@ -2349,8 +2353,9 @@ class SettingsDialog(QDialog):
                 self.awareness_enabled_checkbox
             )
             # 连接信号：切换开关时立即启停感知引擎，无需等保存。
+            # 通过信号通知主窗口（SettingsDialog 不直接持有感知引擎）。
             self.awareness_enabled_checkbox.toggled.connect(
-                self._on_awareness_toggled
+                lambda checked: self.awareness_toggled.emit(checked)
             )
 
             # 间隔设置
@@ -7376,6 +7381,19 @@ class AronaUI(QMainWindow):
                     self.ai_client,
                     self,
                 )
+                # 将对话框的感知开关信号连接到主窗口的处理逻辑。
+                dialog.awareness_toggled.connect(
+                    self._on_awareness_toggled
+                )
+                # 同步开关初始状态：以当前设置值为准，反映主窗口实际状态。
+                if hasattr(dialog, "awareness_enabled_checkbox"):
+                    aw_settings = (
+                        self.ai_client.settings.settings
+                        .get("desktop_awareness", {})
+                    )
+                    dialog.awareness_enabled_checkbox.setChecked(
+                        bool(aw_settings.get("enabled", False))
+                    )
             finally:
                 _t_a1 = _t.monotonic()
                 _diag["dialog_create_ms"] = (_t_a1 - _t_a0) * 1000
@@ -9640,6 +9658,37 @@ class AronaUI(QMainWindow):
                     targets.append(
                         (f"worker#{index}", pair[0])
                     )
+
+        except Exception as exc:
+
+            print(f'[Desktop Transparency] Error collecting worker_threads: {exc}')
+            import traceback
+            traceback.print_exc()
+
+        # 感知回复线程也纳入关闭流程。
+        try:
+
+            for index, pair in enumerate(
+                list(
+                    getattr(
+                        self,
+                        "awareness_reply_threads",
+                        [],
+                    )
+                )
+            ):
+
+                if isinstance(pair, (tuple, list)) and len(pair) >= 2:
+
+                    targets.append(
+                        (f"awareness_reply#{index}", pair[0])
+                    )
+
+        except Exception as exc:
+
+            print(f'[Desktop Transparency] Error collecting awareness_reply_threads: {exc}')
+            import traceback
+            traceback.print_exc()
 
         except Exception as exc:
 

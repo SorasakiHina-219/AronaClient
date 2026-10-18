@@ -1,0 +1,73 @@
+﻿python.exe : test_lambda_not_direct_ref (__main__.TestSettingsDialogFix.test_lambda_not_direct_ref) ... ok
+所在位置 行:2 字符: 1
++ & "C:\Users\HINA\AronaClient\.venv\Scripts\python.exe" "C:\Users\HINA ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (test_lambda_not...ect_ref) ... ok:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+test_no_attribute_error (__main__.TestSettingsDialogFix.test_no_attribute_error) ... ok
+test_open_settings_connects_signal (__main__.TestSettingsDialogFix.test_open_settings_connects_signal) ... ok
+test_open_settings_syncs_checkbox (__main__.TestSettingsDialogFix.test_open_settings_syncs_checkbox) ... ok
+test_signal_exists (__main__.TestSettingsDialogFix.test_signal_exists) ... ok
+test_a_isolated_context (__main__.TestChatHistoryIsolation.test_a_isolated_context)
+A. API �յ������б���� self.messages ���á� ... ok
+test_a_save_not_called (__main__.TestChatHistoryIsolation.test_a_save_not_called)
+A. _save_current_session δ�����á� ... ok
+test_a_success_no_pollution (__main__.TestChatHistoryIsolation.test_a_success_no_pollution)
+A. ��֪����ɹ���messages ���䡣 ... ok
+test_b_failure_no_pollution (__main__.TestChatHistoryIsolation.test_b_failure_no_pollution)
+B. ��֪����ʧ�ܣ�messages �ͻỰ���䡣 ... ok
+test_c_default_unchanged (__main__.TestChatHistoryIsolation.test_c_default_unchanged)
+C. ��ͨ����Ĭ����Ϊ���䡣 ... ok
+test_c_session_saved_normal (__main__.TestChatHistoryIsolation.test_c_session_saved_normal)
+C. ��ͨ����ʱ�Ự�����档 ... ok
+test_d_session_switch_safe (__main__.TestChatHistoryIsolation.test_d_session_switch_safe)
+D. �Ự�л�ʱ��֪����д���κλỰ�� ... ok
+test_parameter_default_true (__main__.TestChatHistoryIsolation.test_parameter_default_true)
+ȷ�� save_to_session Ĭ��ֵΪ True�� ... ok
+test_awareness_reply_worker_uses_false (__main__.TestThreadLifecycle.test_awareness_reply_worker_uses_false)
+ȷ�� AwarenessReplyWorker.run() �� save_to_session=False�� ... ok
+test_remove_method_exists (__main__.TestThreadLifecycle.test_remove_method_exists)
+ȷ�� _remove_awareness_reply_thread �����������߼���ȷ�� ... ok
+test_source_includes_awareness_threads (__main__.TestThreadLifecycle.test_source_includes_awareness_threads)
+ȷ�� _stop_background_threads ���� awareness_reply_threads �ռ��� ... ok
+test_thread_append_structure (__main__.TestThreadLifecycle.test_thread_append_structure)
+ȷ�� awareness_reply_threads ʹ�� (thread, worker) Ԫ�顣 ... ok
+test_py_compile (__main__.TestRegression.test_py_compile) ... ok
+test_qt_thread_safety (__main__.TestRegression.test_qt_thread_safety) ... ok
+test_security_regression (__main__.TestRegression.test_security_regression)
+��ȫ�ع飺ע�� dotenv ȱʧ�ǻ������⣬�Ǳ����޸����롣 ... ok
+test_worker_token_isolation (__main__.TestRegression.test_worker_token_isolation) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 3.545s
+
+OK
+======================================================================
+独立回归验证 — 修复版
+======================================================================
+  [PASS] 开关信号通过 lambda emit
+  [PASS] SettingsDialog 创建无 AttributeError
+  [PASS] open_settings 连接 dialog.awareness_toggled
+  [PASS] open_settings 同步 checkbox 初始状态
+  [PASS] awareness_toggled Signal 存在
+  [PASS] API 收到独立消息列表
+  [PASS] _save_current_session 未被调用
+  [PASS] 成功感知请求不污染 messages
+  [PASS] 失败请求不污染 messages 和会话
+  [PASS] 普通聊天行为不变
+  [PASS] 普通聊天保存会话
+  [PASS] 会话切换时感知请求安全
+  [PASS] save_to_session 默认值为 True
+  [PASS] AwarenessReplyWorker 使用 save_to_session=False
+  [PASS] _remove_awareness_reply_thread 清理逻辑存在
+  [PASS] _stop_background_threads 包含 awareness_reply_threads
+  [PASS] awareness_reply_threads 使用 (thread, worker) 结构
+  [PASS] py_compile 4/4
+  [PASS] Qt 线程安全
+  [PASS] 安全回归 (dotenv 缺失为环境已知问题)
+  [PASS] WorkerToken 隔离
+
+======================================================================
+汇总: 21 总计 | 21 通过 | 0 失败 | 0 错误
+======================================================================
