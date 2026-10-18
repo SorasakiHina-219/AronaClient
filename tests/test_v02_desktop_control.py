@@ -45,11 +45,11 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
             mock_dns.return_value = [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 mock_response = MagicMock()
-                mock_response.status_code = 302
+                mock_response.status = 302
                 mock_response.headers = {'location': 'http://evil.com/file.zip'}
-                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+                mock_pool_cls.return_value.__enter__.return_value.request.return_value = mock_response
 
                 result = self.downloader.download('https://example.com/redirect')
                 self.assertFalse(result['success'])
@@ -63,11 +63,11 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
                 [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))],
                 [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.1', 0))],
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 mock_response = MagicMock()
-                mock_response.status_code = 302
+                mock_response.status = 302
                 mock_response.headers = {'location': 'https://192.168.1.1/file.zip'}
-                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+                mock_pool_cls.return_value.__enter__.return_value.request.return_value = mock_response
 
                 result = self.downloader.download('https://example.com/redirect')
                 self.assertFalse(result['success'])
@@ -78,11 +78,11 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
             mock_dns.return_value = [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 mock_response = MagicMock()
-                mock_response.status_code = 302
+                mock_response.status = 302
                 mock_response.headers = {'location': 'https://example.com/loop'}
-                mock_httpx.Client.return_value.__enter__.return_value.get.side_effect = [
+                mock_pool_cls.return_value.__enter__.return_value.request.side_effect = [
                     mock_response, mock_response, mock_response,
                     mock_response, mock_response, mock_response,
                 ]
@@ -96,13 +96,13 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
             mock_dns.return_value = [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 def make_redirect(*args, **kwargs):
                     resp = MagicMock()
                     resp.status_code = 302
                     resp.headers = {'location': 'https://example.com/next'}
                     return resp
-                mock_httpx.Client.return_value.__enter__.return_value.get.side_effect = make_redirect
+                mock_pool_cls.return_value.__enter__.return_value.request.side_effect = make_redirect
 
                 result = self.downloader.download('https://example.com/start')
                 self.assertFalse(result['success'])
@@ -590,13 +590,13 @@ class TestDownloaderSizeLimit(unittest.TestCase):
             mock_dns.return_value = [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 mock_response = MagicMock()
-                mock_response.status_code = 200
+                mock_response.status = 200
                 mock_response.headers = {'content-length': '999'}
-                mock_response.content = b'x' * 999
+                mock_response.data = b'x' * 999
                 mock_response.url = 'https://example.com/large'
-                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+                mock_pool_cls.return_value.__enter__.return_value.request.return_value = mock_response
 
                 result = d.download('https://example.com/large')
                 self.assertFalse(result['success'])
@@ -610,13 +610,13 @@ class TestDownloaderSizeLimit(unittest.TestCase):
             mock_dns.return_value = [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
             ]
-            with patch('computer.downloader.httpx') as mock_httpx:
+            with patch('computer.downloader.urllib3.HTTPSConnectionPool') as mock_pool_cls:
                 mock_response = MagicMock()
-                mock_response.status_code = 200
+                mock_response.status = 200
                 mock_response.headers = {}  # No content-length
-                mock_response.content = b'x' * 200  # But actual content is 200 bytes
+                mock_response.data = b'x' * 200  # But actual content is 200 bytes
                 mock_response.url = 'https://example.com/medium'
-                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+                mock_pool_cls.return_value.__enter__.return_value.request.return_value = mock_response
 
                 result = d.download('https://example.com/medium')
                 self.assertFalse(result['success'])

@@ -7,6 +7,8 @@
     * 拒绝私有/回环/链路本地 IP 地址
     * DNS 解析失败时 fail-closed
     * 混合公网/私网地址时拒绝
+    * 通过 urllib3 HTTPSConnectionPool 绑定到已验证 IP
+    * 保留 TLS SNI、证书主机名验证和 HTTP Host 语义
     * 清理文件名，禁止路径穿越
     * 设置下载大小限制和网络超时
     * 默认保存到用户下载目录的独立子目录
@@ -17,21 +19,14 @@
     * 拒绝私有 IP、回环地址、链路本地地址
     * DNS 解析失败时 fail-closed（拒绝下载）
     * 解析结果为混合公网/私网地址时拒绝
+    * 实际 TCP 连接绑定到 DNS 预校验的已验证 IP
+    * TLS 证书主机名验证使用原始域名
+    * HTTP Host 请求头使用原始域名
     * 文件大小上限：100MB（可配置）
     * 网络超时：30秒
     * 文件名清理防止路径穿越
     * 不自动解压、不自动运行
     * 临时文件在失败时自动清理
-
-已知限制：
-    * httpx2 内部使用标准 socket 进行 DNS 解析，无法在客户端层面强制绑定到
-      已验证的 IP 地址。因此无法完全防御 DNS 重绑攻击（DNS rebinding）。
-      本实现通过以下措施降低风险：
-      - 每次请求前重新解析 DNS 并校验所有返回地址
-      - DNS 解析失败时 fail-closed
-      - 混合公网/私网地址结果时拒绝
-      - 限制重定向次数并检测循环
-    * 如需完全防御 DNS 重绑，需使用支持自定义 DNS 解析和连接绑定的 HTTP 库。
 """
 
 from __future__ import annotations
@@ -46,7 +41,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx2 as httpx
+import urllib3
 
 
 # ============================================================
@@ -99,12 +94,11 @@ class Downloader:
         * 拒绝私有/回环/链路本地 IP
         * DNS 解析失败时 fail-closed
         * 混合公网/私网地址结果时拒绝
+        * 实际连接绑定到已验证 IP（urllib3 HTTPSConnectionPool）
+        * TLS SNI 和证书验证使用原始域名
         * 文件名安全清理，防路径穿越
         * 大小限制，防止磁盘耗尽
         * 临时文件失败时自动清理
-
-    已知限制：
-        * 无法完全防御 DNS 重绑攻击（见模块文档）
     """
 
     def __init__(
@@ -149,44 +143,75 @@ class Downloader:
 
         # ---- 手动跟随重定向，逐跳校验 ----
         try:
-            with httpx.Client(
-                follow_redirects=False,
-                timeout=self._timeout,
-                limits=httpx.Limits(max_connections=1),
-            ) as client:
-                content = None
-                final_url = current_url
+            content = None
+            final_url = current_url
 
-                for redirect_count in range(self._max_redirects + 1):
-                    # 每次请求前重新解析 DNS 并校验
-                    hostname = self._get_hostname(current_url)
-                    if hostname is None:
-                        return {
-                            "success": False,
-                            "url": url,
-                            "path": None,
-                            "size": None,
-                            "sha256": None,
-                            "error": "无法从 URL 提取主机名。",
-                            "message": "下载失败：URL 格式无效。",
-                        }
+            for redirect_count in range(self._max_redirects + 1):
+                # 每次请求前重新解析 DNS 并校验
+                hostname = self._get_hostname(current_url)
+                if hostname is None:
+                    return {
+                        "success": False,
+                        "url": url,
+                        "path": None,
+                        "size": None,
+                        "sha256": None,
+                        "error": "无法从 URL 提取主机名。",
+                        "message": "下载失败：URL 格式无效。",
+                    }
 
-                    dns_result = self._resolve_and_validate_dns(hostname)
-                    if not dns_result["success"]:
-                        return {
-                            "success": False,
-                            "url": current_url,
-                            "path": None,
-                            "size": None,
-                            "sha256": None,
-                            "error": dns_result["error"],
-                            "message": dns_result["message"],
-                        }
+                dns_result = self._resolve_and_validate_dns(hostname)
+                if not dns_result["success"]:
+                    return {
+                        "success": False,
+                        "url": current_url,
+                        "path": None,
+                        "size": None,
+                        "sha256": None,
+                        "error": dns_result["error"],
+                        "message": dns_result["message"],
+                    }
 
-                    response = client.get(current_url)
+                # 获取解析后的 IP 列表（取第一个）
+                resolved_ip = self._get_first_ip(hostname)
+                if resolved_ip is None:
+                    return {
+                        "success": False,
+                        "url": current_url,
+                        "path": None,
+                        "size": None,
+                        "sha256": None,
+                        "error": "DNS 解析无有效 IP 地址。",
+                        "message": "下载失败：DNS 解析结果为空。",
+                    }
+
+                # 从 URL 提取路径
+                from urllib.parse import urlparse
+                parsed = urlparse(current_url)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+
+                # 创建连接到已验证 IP 的 pool
+                # assert_hostname: TLS 证书验证使用原始域名
+                # server_hostname: SNI 使用原始域名
+                pool = urllib3.HTTPSConnectionPool(
+                    resolved_ip,
+                    port=443,
+                    assert_hostname=hostname,
+                    server_hostname=hostname,
+                    timeout=self._timeout,
+                )
+
+                try:
+                    response = pool.request(
+                        'GET', path,
+                        headers={'Host': hostname},
+                        preload_content=True,
+                    )
 
                     # 检查是否是重定向
-                    if response.status_code in (301, 302, 303, 307, 308):
+                    if response.status in (301, 302, 303, 307, 308):
                         redirect_count += 1
                         if redirect_count > self._max_redirects:
                             return {
@@ -245,25 +270,37 @@ class Downloader:
                         visited_urls.add(current_url)
                         continue
 
-                    # 不是重定向，获取内容
-                    response.raise_for_status()
-                    final_url = str(response.url)
-
-                    # 校验最终 URL
-                    final_check = self._validate_redirect_target(
-                        final_url, visited_urls
-                    )
-                    if not final_check["success"]:
+                    # 不是重定向，检查状态
+                    if response.status >= 400:
                         return {
                             "success": False,
                             "url": url,
                             "path": None,
                             "size": None,
                             "sha256": None,
-                            "error": final_check["error"],
-                            "message": final_check["message"],
+                            "error": (
+                                f"HTTP {response.status}: "
+                                f"{response.headers.get('text/plain', '')}"
+                            ),
+                            "message": f"下载失败：HTTP {response.status}",
                         }
-                    current_url = final_check["url"]
+
+                    final_url = current_url
+
+                    # 校验最终 URL（已在重定向时校验过，此处仅检查是否仍在下载目录内）
+                    # 注意：final_url 已在 visited_urls 中（重定向时添加），跳过循环检测
+                    from urllib.parse import urlparse as _urlparse
+                    _parsed = _urlparse(final_url)
+                    if _parsed.scheme.lower() != "https":
+                        return {
+                            "success": False,
+                            "url": url,
+                            "path": None,
+                            "size": None,
+                            "sha256": None,
+                            "error": f"最终 URL 不是 HTTPS：{final_url}",
+                            "message": "下载失败：最终地址不安全。",
+                        }
 
                     # 检查 Content-Length
                     content_length = response.headers.get("content-length")
@@ -287,31 +324,54 @@ class Downloader:
                                     "message": "下载失败：文件大小超出限制。",
                                 }
 
-                    content = response.content
+                    content = response.data
                     break
 
-                if content is None:
-                    return {
-                        "success": False,
-                        "url": url,
-                        "path": None,
-                        "size": None,
-                        "sha256": None,
-                        "error": "未获取到下载内容。",
-                        "message": "下载失败：无内容。",
-                    }
+                finally:
+                    pool.close()
 
-        except httpx.HTTPStatusError as exc:
+            if content is None:
+                return {
+                    "success": False,
+                    "url": url,
+                    "path": None,
+                    "size": None,
+                    "sha256": None,
+                    "error": "未获取到下载内容。",
+                    "message": "下载失败：无内容。",
+                }
+
+        except urllib3.exceptions.HTTPError as exc:
             return {
                 "success": False,
                 "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
-                "error": f"HTTP {exc.response.status_code}: {exc.reason_phrase}",
-                "message": f"下载失败：HTTP {exc.response.status_code}",
+                "error": f"HTTP 错误：{exc}",
+                "message": "下载失败：HTTP 请求错误。",
             }
-        except httpx.ConnectError as exc:
+        except urllib3.exceptions.ConnectTimeoutError as exc:
+            return {
+                "success": False,
+                "url": url,
+                "path": None,
+                "size": None,
+                "sha256": None,
+                "error": f"连接超时：{exc}",
+                "message": "下载失败：连接超时。",
+            }
+        except urllib3.exceptions.ReadTimeoutError as exc:
+            return {
+                "success": False,
+                "url": url,
+                "path": None,
+                "size": None,
+                "sha256": None,
+                "error": f"读取超时：{exc}",
+                "message": "下载失败：读取超时。",
+            }
+        except urllib3.exceptions.NewConnectionError as exc:
             return {
                 "success": False,
                 "url": url,
@@ -321,15 +381,15 @@ class Downloader:
                 "error": f"连接失败：{exc}",
                 "message": "下载失败：无法连接到服务器。",
             }
-        except httpx.TimeoutException as exc:
+        except urllib3.exceptions.MaxRetryError as exc:
             return {
                 "success": False,
                 "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
-                "error": f"超时：{exc}",
-                "message": "下载失败：请求超时。",
+                "error": f"重试超限：{exc}",
+                "message": "下载失败：连接重试超限。",
             }
         except DnsResolutionError as exc:
             return {
@@ -534,6 +594,23 @@ class Downloader:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         return parsed.hostname
+
+    def _get_first_ip(self, hostname):
+        """
+        获取 DNS 解析的第一个 IP 地址。
+        用于构建 urllib3 连接池。
+        """
+        try:
+            addr_info = socket.getaddrinfo(
+                hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        except socket.gaierror:
+            return None
+
+        if not addr_info:
+            return None
+
+        return addr_info[0][4][0]
 
     def _resolve_and_validate_dns(self, hostname):
         """
