@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QBuffer, QIODevice, Qt
+from PySide6.QtCore import QBuffer, QIODevice, QMetaObject, Qt, QObject, QCoreApplication
 from PySide6.QtGui import QGuiApplication, QImage
 
 
@@ -143,6 +143,51 @@ def _settle(seconds):
         pass
 
 
+# ============================================================
+# 线程安全窗口管理
+# ============================================================
+#
+# 重要说明：
+#   Qt 官方文档要求所有 GUI 操作在主线程执行。
+#   temporarily_hidden 可能被 worker 线程调用（桌面感知后台循环），
+#   因此必须将窗口 hide/show/raise_/activateWindow/setWindowState
+#   路由到主线程，而不能直接在 worker 线程中调用。
+#
+#   截图操作（screen.grabWindow(0)）和窗口信息读取（Win32 ctypes）
+#   不依赖 Qt widget 状态，可以在 worker 线程中安全执行。
+# ============================================================
+
+
+def _is_main_thread() -> bool:
+    """检查当前是否在 Qt 主线程中。"""
+    try:
+        app = QCoreApplication.instance()
+        if app is None:
+            return True  # 无应用实例时假设安全
+        return app.thread() is QCoreApplication.instance().thread()
+    except Exception:
+        return True
+
+
+def _invoke_on_main_thread(obj: QObject, method_name: str, *args) -> None:
+    """
+    将方法调用排队到主线程执行。
+
+    如果当前已在主线程，则直接调用；
+    否则通过 QMetaObject.invokeMethod 排队到主线程。
+    """
+    if _is_main_thread():
+        getattr(obj, method_name)(*args)
+        return
+
+    # 使用 QueuedConnection 确保在主线程的 event loop 中执行
+    QMetaObject.invokeMethod(
+        obj, method_name,
+        Qt.QueuedConnection,
+        *args,
+    )
+
+
 @contextmanager
 def temporarily_hidden(widgets, settle_seconds=DEFAULT_SETTLE_SECONDS):
     """
@@ -156,8 +201,12 @@ def temporarily_hidden(widgets, settle_seconds=DEFAULT_SETTLE_SECONDS):
             隐藏后 -> 回落到 0.1%
         所以不隐藏的话，拍到的几乎全是自己。
 
+    线程安全：
+        窗口隐藏/恢复操作通过 QMetaObject.invokeMethod
+        排队到主线程执行，避免在 worker 线程中直接调用 GUI API。
+        截图操作（grabWindow）在路由到主线程后执行。
+
     无论正常结束、取消还是抛异常，都会恢复窗口。
-    默认保持最小改动：只隐藏传进来的窗口，不动其他窗口。
     """
 
     hidden = []
@@ -173,7 +222,8 @@ def temporarily_hidden(widgets, settle_seconds=DEFAULT_SETTLE_SECONDS):
             was_visible = w.isVisible()
             state = w.windowState()
 
-            w.hide()
+            # 路由到主线程执行窗口隐藏
+            _invoke_on_main_thread(w, "hide")
 
             hidden.append(
                 (w, was_visible, state)
@@ -197,14 +247,14 @@ def temporarily_hidden(widgets, settle_seconds=DEFAULT_SETTLE_SECONDS):
 
                 if was_visible:
 
-                    w.show()
+                    # 路由到主线程执行窗口恢复
+                    _invoke_on_main_thread(w, "show")
 
                     if state:
+                        _invoke_on_main_thread(w, "setWindowState", state)
 
-                        w.setWindowState(state)
-
-                    w.raise_()
-                    w.activateWindow()
+                    _invoke_on_main_thread(w, "raise_")
+                    _invoke_on_main_thread(w, "activateWindow")
 
             except Exception:
 
@@ -628,9 +678,10 @@ class DesktopVision:
 
         线程安全：
             手动截图路径在主线程调用；V1 感知路径在 worker 线程调用。
-            window.hide/show、screen.grabWindow(0) 在主线程环境下安全；
-            在 worker 线程中调用时，_settle() 仅做时间等待，不触碰
-            Qt 事件循环，避免跨线程事件交叉。
+            窗口 hide/show/raise_/activateWindow 通过 QMetaObject.invokeMethod
+            排队到主线程执行，避免跨线程 GUI 操作。
+            screen.grabWindow(0) 和 get_active_window_info() 不依赖
+            widget 状态，可在任意线程安全执行。
         """
 
         # ---------------- 门禁：必须在任何桌面读取之前 ----------------
@@ -663,7 +714,12 @@ class DesktopVision:
         settle_seconds: float,
     ) -> ScreenShot:
         """
-        实际的截图实现。必须在 Qt 主线程调用。
+        实际的截图实现。
+
+        线程安全：
+            - 窗口隐藏/恢复：通过 temporarily_hidden 路由到主线程
+            - grabWindow(0)：屏幕级操作，任意线程安全
+            - get_active_window_info()：Win32 ctypes，任意线程安全
         """
         app = QGuiApplication.instance()
 
