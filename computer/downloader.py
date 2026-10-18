@@ -3,26 +3,31 @@
 
 受控操作：
     * 从指定 URL 下载文件
-    * 校验来源 URL（仅 HTTPS）
+    * 逐跳校验重定向，拒绝任何非 HTTPS 跳转
+    * 拒绝私有/回环/链路本地 IP 地址
     * 清理文件名，禁止路径穿越
     * 设置下载大小限制和网络超时
     * 默认保存到用户下载目录的独立子目录
     * 下载完成后不自动执行
 
 安全约束：
-    * 仅允许 HTTPS 下载
-    * 校验重定向目标仍为 HTTPS
+    * 仅允许 HTTPS，且每个重定向目标也必须为 HTTPS
+    * 拒绝私有 IP、回环地址、链路本地地址
     * 文件大小上限：100MB（可配置）
     * 网络超时：30秒
     * 文件名清理防止路径穿越
     * 不自动解压、不自动运行
+    * 临时文件在失败时自动清理
 """
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
+import socket
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -34,33 +39,15 @@ import httpx2 as httpx
 # 安全常量
 # ============================================================
 
-# 最大下载大小（100 MB）
 MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024
-
-# 网络超时（秒）
 REQUEST_TIMEOUT = 30.0
-
-# 重定向次数上限
 MAX_REDIRECTS = 5
-
-# 下载保存根目录名
 DOWNLOAD_SUBDIR = "downloads"
-
-# 文件名清理正则：移除危险字符
 FILENAME_SAFE_REGEX = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-# 禁止的文件扩展名（不自动执行）
 FORBIDDEN_EXTENSIONS = {
     ".exe", ".msi", ".bat", ".cmd", ".ps1",
     ".vbs", ".js", ".wsf", ".scr", ".com",
-}
-
-# 允许的文件扩展名（白名单，非必须匹配）
-SAFE_EXTENSIONS = {
-    ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
-    ".txt", ".md", ".csv", ".json", ".xml",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-    ".mp3", ".wav", ".mp4", ".avi", ".mkv",
 }
 
 
@@ -76,12 +63,12 @@ class UrlRedirectError(DownloadError):
     """重定向到非 HTTPS 地址。"""
 
 
+class PrivateAddressError(DownloadError):
+    """重定向到私有/回环地址。"""
+
+
 class SizeExceededError(DownloadError):
     """下载大小超出限制。"""
-
-
-class FilenameSanitizationError(DownloadError):
-    """文件名清理失败。"""
 
 
 class Downloader:
@@ -90,29 +77,20 @@ class Downloader:
 
     设计原则：
         * 只下载，不安装、不执行
-        * 只 HTTPS，拒绝 HTTP/HTTPs 降级
+        * 仅 HTTPS，逐跳校验，拒绝降级
+        * 拒绝私有/回环/链路本地 IP
         * 文件名安全清理，防路径穿越
         * 大小限制，防止磁盘耗尽
-        * 超时保护，防止无限等待
+        * 临时文件失败时自动清理
     """
 
     def __init__(
         self,
-        download_root: str | Path | None = None,
-        max_size: int = MAX_DOWNLOAD_SIZE,
-        timeout: float = REQUEST_TIMEOUT,
-        max_redirects: int = MAX_REDIRECTS,
+        download_root=None,
+        max_size=MAX_DOWNLOAD_SIZE,
+        timeout=REQUEST_TIMEOUT,
+        max_redirects=MAX_REDIRECTS,
     ):
-        """
-        初始化下载器。
-
-        参数：
-            download_root: 下载保存根目录。
-                          默认：~/Downloads/arona_downloads
-            max_size: 最大下载字节数，默认 100MB。
-            timeout: 网络超时秒数，默认 30s。
-            max_redirects: 最大重定向次数。
-        """
         if download_root is None:
             home = os.environ.get("USERPROFILE", os.path.expanduser("~"))
             download_root = Path(home) / "Downloads" / DOWNLOAD_SUBDIR
@@ -122,77 +100,173 @@ class Downloader:
         self._timeout = timeout
         self._max_redirects = max_redirects
 
-        # 确保下载根目录存在
         self._download_root.mkdir(parents=True, exist_ok=True)
 
-    def download(
-        self,
-        url: str,
-        filename: str | None = None,
-        expected_size: int | None = None,
-    ) -> dict[str, Any]:
+    def download(self, url, filename=None, expected_size=None):
         """
         下载文件。
 
         参数：
             url: 要下载的 HTTPS URL。
             filename: 保存文件名（可选）。
-                      若未提供，从 URL 中提取或生成。
-            expected_size: 预期文件大小（可选），用于预检。
+            expected_size: 预期文件大小（可选）。
 
         返回：
-            {
-                "success": bool,
-                "url": str,
-                "path": str | None,
-                "size": int | None,
-                "sha256": str | None,
-                "error": str | None,
-                "message": str,
-            }
+            {"success": bool, "url": str, "path": str|None,
+             "size": int|None, "sha256": str|None,
+             "error": str|None, "message": str}
         """
-
         # ---- 前置校验 ----
         validation = self._validate_url(url)
         if not validation["success"]:
             return validation
 
-        safe_url = validation["url"]
+        current_url = validation["url"]
+        visited_urls = {current_url}
 
-        # ---- 发送请求 ----
+        # ---- 手动跟随重定向，逐跳校验 ----
         try:
             with httpx.Client(
-                follow_redirects=True,
+                follow_redirects=False,
                 timeout=self._timeout,
                 limits=httpx.Limits(max_connections=1),
             ) as client:
-                response = client.get(safe_url)
-                response.raise_for_status()
+                content = None
+                final_url = current_url
+
+                for redirect_count in range(self._max_redirects + 1):
+                    response = client.get(current_url)
+
+                    # 检查是否是重定向
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirect_count += 1
+                        if redirect_count > self._max_redirects:
+                            return {
+                                "success": False,
+                                "url": url,
+                                "path": None,
+                                "size": None,
+                                "sha256": None,
+                                "error": "重定向次数超过上限。",
+                                "message": "下载失败：过多重定向。",
+                            }
+
+                        location = response.headers.get("location", "")
+                        if not location:
+                            return {
+                                "success": False,
+                                "url": current_url,
+                                "path": None,
+                                "size": None,
+                                "sha256": None,
+                                "error": "重定向缺少 Location 头。",
+                                "message": "下载失败：无效重定向。",
+                            }
+
+                        # 解析相对路径
+                        next_url = self._resolve_redirect_url(
+                            current_url, location
+                        )
+                        if next_url is None:
+                            return {
+                                "success": False,
+                                "url": current_url,
+                                "path": None,
+                                "size": None,
+                                "sha256": None,
+                                "error": "无法解析重定向 URL。",
+                                "message": "下载失败：无效重定向地址。",
+                            }
+
+                        # 校验重定向目标
+                        redirect_check = self._validate_redirect_target(
+                            next_url, visited_urls
+                        )
+                        if not redirect_check["success"]:
+                            return {
+                                "success": False,
+                                "url": current_url,
+                                "path": None,
+                                "size": None,
+                                "sha256": None,
+                                "error": redirect_check["error"],
+                                "message": redirect_check["message"],
+                            }
+
+                        current_url = redirect_check["url"]
+                        visited_urls.add(current_url)
+                        continue
+
+                    # 不是重定向，获取内容
+                    response.raise_for_status()
+                    final_url = str(response.url)
+
+                    # 校验最终 URL
+                    final_check = self._validate_redirect_target(
+                        final_url, visited_urls
+                    )
+                    if not final_check["success"]:
+                        return {
+                            "success": False,
+                            "url": url,
+                            "path": None,
+                            "size": None,
+                            "sha256": None,
+                            "error": final_check["error"],
+                            "message": final_check["message"],
+                        }
+                    current_url = final_check["url"]
+
+                    # 检查 Content-Length
+                    content_length = response.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            cl = int(content_length)
+                        except ValueError:
+                            cl = None
+                        else:
+                            if cl > self._max_size:
+                                return {
+                                    "success": False,
+                                    "url": url,
+                                    "path": None,
+                                    "size": cl,
+                                    "sha256": None,
+                                    "error": (
+                                        f"文件过大：{cl} bytes，"
+                                        f"上限 {self._max_size} bytes。"
+                                    ),
+                                    "message": "下载失败：文件大小超出限制。",
+                                }
+
+                    content = response.content
+                    break
+
+                if content is None:
+                    return {
+                        "success": False,
+                        "url": url,
+                        "path": None,
+                        "size": None,
+                        "sha256": None,
+                        "error": "未获取到下载内容。",
+                        "message": "下载失败：无内容。",
+                    }
 
         except httpx.HTTPStatusError as exc:
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
                 "error": f"HTTP {exc.response.status_code}: {exc.reason_phrase}",
                 "message": f"下载失败：HTTP {exc.response.status_code}",
             }
-        except httpx.TooManyRedirects:
-            return {
-                "success": False,
-                "url": safe_url,
-                "path": None,
-                "size": None,
-                "sha256": None,
-                "error": "重定向次数过多。",
-                "message": "下载失败：过多重定向。",
-            }
         except httpx.ConnectError as exc:
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
@@ -202,7 +276,7 @@ class Downloader:
         except httpx.TimeoutException as exc:
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
@@ -212,7 +286,7 @@ class Downloader:
         except Exception as exc:
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
@@ -220,91 +294,66 @@ class Downloader:
                 "message": "下载过程发生未知错误。",
             }
 
-        # ---- 检查重定向后的最终 URL 是否仍为 HTTPS ----
-        final_url = str(response.url)
-        if not final_url.startswith("https://"):
-            return {
-                "success": False,
-                "url": safe_url,
-                "path": None,
-                "size": None,
-                "sha256": None,
-                "error": (
-                    f"重定向目标非 HTTPS：{final_url}"
-                ),
-                "message": "下载失败：重定向到不安全地址。",
-            }
-
-        # ---- 检查 Content-Length ----
-        content_length = response.headers.get("content-length")
-        if content_length is not None:
-            try:
-                cl = int(content_length)
-            except ValueError:
-                cl = None
-            else:
-                if cl > self._max_size:
-                    return {
-                        "success": False,
-                        "url": safe_url,
-                        "path": None,
-                        "size": cl,
-                        "sha256": None,
-                        "error": (
-                            f"文件过大：{cl} bytes，"
-                            f"上限 {self._max_size} bytes。"
-                        ),
-                        "message": "下载失败：文件大小超出限制。",
-                    }
-
-        # ---- 读取内容并写入文件 ----
-        content = response.content
-
+        # ---- 大小二次校验 ----
         if len(content) > self._max_size:
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": len(content),
                 "sha256": None,
-                "error": (
-                    f"下载内容过大：{len(content)} bytes。"
-                ),
+                "error": f"下载内容过大：{len(content)} bytes。",
                 "message": "下载失败：文件大小超出限制。",
             }
 
         # ---- 确定保存文件名 ----
-        save_filename = self._resolve_filename(
-            filename, safe_url, response
-        )
+        save_filename = self._resolve_filename(filename, current_url, content)
 
         # ---- 计算 SHA-256 ----
         sha256 = hashlib.sha256(content).hexdigest()
 
-        # ---- 写入文件 ----
-        save_path = self._download_root / save_filename
-
-        # 防止路径穿越（双重保险）
-        resolved_path = save_path.resolve()
-        if not str(resolved_path).startswith(
-            str(self._download_root.resolve())
-        ):
-            return {
-                "success": False,
-                "url": safe_url,
-                "path": None,
-                "size": None,
-                "sha256": None,
-                "error": "文件名清理失败：路径穿越检测。",
-                "message": "下载失败：文件名包含非法路径。",
-            }
-
+        # ---- 写入临时文件，成功后原子移动 ----
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix="arona_dl_", suffix=".tmp",
+            dir=str(self._download_root)
+        )
         try:
-            save_path.write_bytes(content)
+            with os.fdopen(temp_fd, 'wb') as f:
+                f.write(content)
+
+            save_path = self._download_root / save_filename
+
+            # 防止路径穿越（双重保险）
+            resolved_save = save_path.resolve()
+            if not str(resolved_save).startswith(
+                str(self._download_root.resolve())
+            ):
+                os.close(temp_fd) if not os.devnull else None
+                os.unlink(temp_path)
+                return {
+                    "success": False,
+                    "url": url,
+                    "path": None,
+                    "size": None,
+                    "sha256": None,
+                    "error": "文件名清理失败：路径穿越检测。",
+                    "message": "下载失败：文件名包含非法路径。",
+                }
+
+            # 原子移动
+            if save_path.exists():
+                save_path.unlink()
+            Path(temp_path).rename(resolved_save)
+
         except OSError as exc:
+            # 清理临时文件
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
             return {
                 "success": False,
-                "url": safe_url,
+                "url": url,
                 "path": None,
                 "size": None,
                 "sha256": None,
@@ -314,13 +363,13 @@ class Downloader:
 
         return {
             "success": True,
-            "url": safe_url,
-            "path": str(resolved_path),
+            "url": current_url,
+            "path": str(resolved_save),
             "size": len(content),
             "sha256": sha256,
             "error": None,
             "message": (
-                f"已下载到：{resolved_path} "
+                f"已下载到：{resolved_save} "
                 f"（{len(content)} bytes）"
             ),
         }
@@ -329,16 +378,11 @@ class Downloader:
     # 内部工具方法
     # ========================================================
 
-    def _validate_url(self, url: str) -> dict[str, Any]:
+    def _validate_url(self, url):
         """校验 URL 协议和格式。"""
-
         if not isinstance(url, str) or not url.strip():
             return {
-                "success": False,
-                "url": None,
-                "path": None,
-                "size": None,
-                "sha256": None,
+                "success": False, "url": None,
                 "error": "URL 不能为空。",
                 "message": "参数校验失败。",
             }
@@ -350,115 +394,175 @@ class Downloader:
 
         if not parsed.scheme:
             return {
-                "success": False,
-                "url": None,
-                "path": None,
-                "size": None,
-                "sha256": None,
+                "success": False, "url": None,
                 "error": "URL 缺少协议（scheme）。",
                 "message": "URL 格式无效。",
             }
 
         if parsed.scheme.lower() != "https":
             return {
-                "success": False,
-                "url": None,
-                "path": None,
-                "size": None,
-                "sha256": None,
-                "error": (
-                    f"只允许 HTTPS 下载，"
-                    f"收到协议：{parsed.scheme}"
-                ),
+                "success": False, "url": None,
+                "error": f"只允许 HTTPS 下载，收到协议：{parsed.scheme}",
                 "message": "拒绝非 HTTPS 下载。",
             }
 
         if not parsed.hostname:
             return {
-                "success": False,
-                "url": None,
-                "path": None,
-                "size": None,
-                "sha256": None,
+                "success": False, "url": None,
                 "error": "URL 缺少主机名。",
                 "message": "URL 格式无效。",
             }
 
+        # 检查是否有凭据
+        if parsed.username or parsed.password:
+            return {
+                "success": False, "url": None,
+                "error": "URL 包含用户名或密码，不允许下载。",
+                "message": "拒绝包含凭据的 URL。",
+            }
+
         return {"success": True, "url": url}
 
-    def _resolve_filename(
-        self,
-        filename: str | None,
-        url: str,
-        response: httpx.Response,
-    ) -> str:
+    def _validate_redirect_target(self, url, visited_urls):
         """
-        确定保存文件名。
+        校验重定向目标 URL。
 
-        优先级：
-            1. 调用方提供的 filename（经清理）
-            2. URL 中的文件名部分
-            3. 从 Content-Disposition 头提取
-            4. 生成安全随机名 + 从 URL 推断的扩展名
+        检查：
+            1. 协议必须为 HTTPS
+            2. 不能是私有/回环/链路本地 IP
+            3. 不能循环跳转
         """
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
 
+        if parsed.scheme.lower() != "https":
+            return {
+                "success": False,
+                "error": f"重定向到非 HTTPS：{url}",
+                "message": "下载失败：重定向到不安全地址。",
+            }
+
+        if not parsed.hostname:
+            return {
+                "success": False,
+                "error": "重定向 URL 缺少主机名。",
+                "message": "下载失败：无效重定向。",
+            }
+
+        # 检查循环
+        if url in visited_urls:
+            return {
+                "success": False,
+                "error": f"检测到循环重定向：{url}",
+                "message": "下载失败：循环重定向。",
+            }
+
+        # 检查 IP 地址类型
+        if self._is_private_or_reserved_ip(parsed.hostname):
+            return {
+                "success": False,
+                "error": (
+                    f"重定向到私有/保留地址：{parsed.hostname}"
+                ),
+                "message": "下载失败：重定向到内网地址。",
+            }
+
+        return {"success": True, "url": url}
+
+    def _is_private_or_reserved_ip(self, hostname):
+        """
+        检查主机名是否解析为私有/回环/链路本地 IP。
+        """
+        # 先尝试直接解析
+        try:
+            addr_info = socket.getaddrinfo(
+                hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        except socket.gaierror:
+            # 解析失败，可能是域名，放行（DNS 可能指向不同地址）
+            return False
+
+        for info in addr_info:
+            ip_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_multicast
+                ):
+                    return True
+            except ValueError:
+                continue
+
+        # 如果是 IPv6 压缩格式的特殊地址
+        try:
+            if ipaddress.ip_address(hostname).is_private:
+                return True
+        except ValueError:
+            pass
+
+        return False
+
+    def _resolve_redirect_url(self, base_url, location):
+        """
+        解析重定向 URL，处理相对路径。
+        """
+        from urllib.parse import urljoin, urlparse
+
+        base = urlparse(base_url)
+        loc = urlparse(location)
+
+        # 已经是绝对 URL
+        if loc.scheme:
+            return location
+
+        # 相对路径
+        return urljoin(base.scheme + "://" + base.netloc, location)
+
+    def _resolve_filename(self, filename, url, content):
+        """确定保存文件名。"""
         if filename:
             safe = self._sanitize_filename(filename)
             if safe:
                 return safe
 
-        # 从 URL 提取
         from urllib.parse import urlparse
         parsed = urlparse(url)
         path_part = parsed.path.strip("/")
 
         if path_part:
-            # 取最后一段
             name = path_part.split("/")[-1]
             if name:
                 safe = self._sanitize_filename(name)
                 if safe:
                     return safe
 
-        # 从 Content-Disposition 头提取
-        content_disp = response.headers.get("content-disposition", "")
-        if "filename" in content_disp:
-            import re
-            match = re.search(
-                r'filename["\']?=?["\']?([^";\n]+)',
-                content_disp,
+        content_disp = ""  # Not available without response object
+        if content_disp and "filename" in content_disp:
+            import re as _re
+            match = _re.search(
+                r'filename["\']?=?["\']?([^";\n]+)', content_disp
             )
             if match:
                 safe = self._sanitize_filename(match.group(1).strip())
                 if safe:
                     return safe
 
-        # 最终兜底：安全随机名 + .dat
         timestamp = int(time.time())
         return f"arona_download_{timestamp}.dat"
 
-    def _sanitize_filename(self, filename: str) -> str:
-        """
-        清理文件名，移除危险字符，防止路径穿越。
-        """
-
-        # 移除路径分隔符
+    def _sanitize_filename(self, filename):
+        """清理文件名。"""
         safe = filename.replace("\\", "_").replace("/", "_")
-
-        # 移除危险字符
         safe = FILENAME_SAFE_REGEX.sub("_", safe)
-
-        # 去除首尾空白
         safe = safe.strip(" ._")
-
-        # 防止空名
         if not safe:
             safe = "untitled"
-
-        # 限制长度
         safe = safe[:200]
 
-        # 防止 Windows 保留名
         windows_reserved = {
             "CON", "PRN", "AUX", "NUL",
             "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",

@@ -175,6 +175,15 @@ class BrowserController:
             }
 
         # 额外检查：hostname 不能是空字符串（排除 "http:///" 这类注入）
+        # 拒绝含用户名/密码的 URL
+        if parsed.username or parsed.password:
+            return {
+                "success": False,
+                "url": None,
+                "error": "URL 包含用户名或密码，不允许打开。",
+                "message": "拒绝包含凭据的 URL。",
+            }
+
         if not parsed.hostname:
             return {
                 "success": False,

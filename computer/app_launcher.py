@@ -12,6 +12,8 @@
     * 不接受包含 ;|&`$() 等 shell 元字符的参数
     * 不接受路径穿越序列（../、..\\ 等）
     * 不接受 .exe/.bat/.cmd/.ps1 之外的可执行文件类型（白名单）
+    * 禁止启动高风险系统工具（cmd.exe, powershell.exe 等）
+    * 禁止从 Windows 系统目录启动
 """
 
 from __future__ import annotations
@@ -35,6 +37,27 @@ FORBIDDEN_EXECUTABLE_EXTENSIONS = {
     ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf"
 }
 
+# 高风险系统工具黑名单（通过名称匹配）
+DANGEROUS_EXECUTABLE_NAMES = {
+    # 命令解释器
+    "cmd.exe", "command.com",
+    "powershell.exe", "powershell_ise.exe",
+    "pwsh.exe",
+    "wsl.exe", "wslconfig.exe",
+    # 脚本引擎
+    "cscript.exe", "wscript.exe",
+    "mshta.exe", "regsvr32.exe",
+    # 系统工具（高风险）
+    "schtasks.exe", "taskeng.exe",
+    "at.exe", "sc.exe",
+    # 远程执行
+    "runas.exe",
+    # 包管理器
+    "npm.exe", "yarn.exe", "pip.exe", "pip3.exe",
+    # 其他高危
+    "msiexec.exe",
+}
+
 MAX_PATH_LENGTH = 4096
 
 
@@ -51,6 +74,7 @@ class AppLauncher:
         * 不拼接用户输入到 shell 命令
         * 不使用 shell=True
         * 不执行批处理/脚本文件
+        * 禁止启动高风险系统工具
     """
 
     def __init__(self, search_paths=None):
@@ -69,7 +93,6 @@ class AppLauncher:
             {"success": bool, "command": str, "pid": int|None,
              "error": str|None, "message": str}
         """
-        # Validate inputs
         valid, data = self._validate(name_or_path, args, workdir)
         if not valid:
             return data
@@ -78,8 +101,16 @@ class AppLauncher:
         resolved_args = data["args"]
         resolved_workdir = data["workdir"]
 
-        # Resolve executable
-        executable = self._resolve_executable(resolved_name)
+        try:
+            executable = self._resolve_executable(resolved_name)
+        except AppLaunchError as exc:
+            return {
+                "success": False,
+                "command": name_or_path,
+                "pid": None,
+                "error": str(exc),
+                "message": "启动被安全策略拒绝。",
+            }
         if executable is None:
             return {
                 "success": False,
@@ -89,7 +120,6 @@ class AppLauncher:
                 "message": "应用不存在或不在 PATH 中。",
             }
 
-        # Build command
         try:
             cmd_parts = [str(executable)]
             if resolved_args:
@@ -97,7 +127,6 @@ class AppLauncher:
         except ValueError:
             cmd_parts = [str(executable)] + resolved_args.split()
 
-        # Launch process
         try:
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -232,17 +261,38 @@ class AppLauncher:
                 raise AppLaunchError(
                     f"禁止启动脚本文件：{path_obj}"
                 )
-            return str(path_obj.resolve())
+            resolved = str(path_obj.resolve())
+            exe_name = path_obj.name.lower()
+            if exe_name in DANGEROUS_EXECUTABLE_NAMES:
+                raise AppLaunchError(
+                    f"禁止启动高风险系统工具：{resolved}"
+                )
+            return resolved
 
         # Case 2: search in PATH
         for ext in [".exe", ".msi", ""]:
             candidate = name_or_path + ext
             found = self._which(candidate)
             if found:
+                exe_name = Path(found).name.lower()
+                if exe_name in DANGEROUS_EXECUTABLE_NAMES:
+                    raise AppLaunchError(
+                        f"禁止启动高风险系统工具：{found}"
+                    )
                 return found
 
         found = self._which(name_or_path)
         if found:
+            exe_name = Path(found).name.lower()
+            if exe_name in DANGEROUS_EXECUTABLE_NAMES:
+                raise AppLaunchError(
+                    f"禁止启动高风险系统工具：{found}"
+                )
+            for prefix in SYSTEM_DIR_PREFIXES:
+                if found.lower().startswith(prefix.lower()):
+                    raise AppLaunchError(
+                        f"禁止从系统目录启动：{found}"
+                    )
             return found
 
         return None
@@ -259,7 +309,6 @@ class AppLauncher:
             if candidate.exists() and candidate.is_file():
                 return str(candidate.resolve())
 
-        # Also check Windows Apps folder
         if os.name == "nt":
             local_apps = Path(
                 os.environ.get("LOCALAPPDATA", ""),
