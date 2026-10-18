@@ -2147,10 +2147,18 @@ class AIClient:
                 tool_result = self._tool_registry.call_tool(
                     tool_name, tool_args
                 )
+                # Truncate tool result to prevent context overflow
+                tool_msg = str(tool_result.get('message', ''))
+                MAX_TOOL_RESULT_CHARS = 4000
+                if len(tool_msg) > MAX_TOOL_RESULT_CHARS:
+                    tool_msg = (
+                        tool_msg[:MAX_TOOL_RESULT_CHARS]
+                        + '...[truncated]'
+                    )
                 context_messages.append({
                     'role': 'tool',
                     'tool_call_id': tc.id,
-                    'content': str(tool_result.get('message', '')),
+                    'content': tool_msg,
                 })
         answer = final_answer
 
