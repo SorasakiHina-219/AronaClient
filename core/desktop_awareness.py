@@ -299,14 +299,35 @@ class _AwarenessWorker(QObject):
 
     def _cycle(self) -> None:
         """执行一轮：截图 → pHash 比较 → 分析（如有变化）。"""
+        import time as _time
+
+        cycle_start = _time.monotonic()
+
         # 1. 获取截图（复用已有授权门禁，仅 DV 开关即可）
         shot = self._capture_screenshot()
         if not shot:
+            elapsed = (_time.monotonic() - cycle_start) * 1000
+            logger.info(
+                "桌面感知：第 %d 轮截图失败或无授权，耗时 %.0fms",
+                self._token.worker_id, elapsed,
+            )
             return  # 授权拒绝或截图失败，跳过本轮
+
+        shot_size_kb = shot.encoded_bytes // 1024
+        logger.info(
+            "桌面感知：第 %d 轮截图成功 %dx%d (%d KB)，耗时 %.0fms",
+            self._token.worker_id,
+            shot.width, shot.height, shot_size_kb,
+            (_time.monotonic() - cycle_start) * 1000,
+        )
 
         # 2. 计算感知哈希
         phash = self._compute_ahash(shot)
         if phash is None:
+            logger.warning(
+                "桌面感知：pHash 计算失败 [gen=%d, id=%d]",
+                self._token.generation, self._token.worker_id,
+            )
             return
 
         # 3. 与上次比较（pHash 完全相同 = 画面无变化）
@@ -318,6 +339,13 @@ class _AwarenessWorker(QObject):
         # 有新变化
         self._prev_phash = phash
         self._change_count_since_last_alert += 1
+        logger.info(
+            "桌面感知：检测到画面变化 [gen=%d, id=%d] "
+            "(变化次数: %d/%d)",
+            self._token.generation, self._token.worker_id,
+            self._change_count_since_last_alert,
+            self._dedup_window,
+        )
 
         # 4. 首次变化立即提醒；持续变化时每 DEDUP_WINDOW 轮提醒一次
         should_alert = (
@@ -326,16 +354,32 @@ class _AwarenessWorker(QObject):
         )
 
         if not should_alert:
-            logger.debug(
+            logger.info(
                 "桌面感知：检测到变化但未达提醒阈值 "
-                "(%d/%d)",
+                "(%d/%d)，跳过",
                 self._change_count_since_last_alert,
                 self._dedup_window,
             )
             return
 
         # 5. AI 分析（复用本轮已采集的同一张截图，不重新截取）
+        analyze_start = _time.monotonic()
         analysis = self._analyze_shot(shot)
+        analyze_elapsed = (_time.monotonic() - analyze_start) * 1000
+
+        if analysis.get("error"):
+            logger.warning(
+                "桌面感知：AI 分析失败 [gen=%d] %.0fms: %s",
+                self._token.generation, analyze_elapsed,
+                analysis["error"][:100],
+            )
+        else:
+            logger.info(
+                "桌面感知：AI 分析完成 [gen=%d] %.0fms，"
+                "结果: %s",
+                self._token.generation, analyze_elapsed,
+                (analysis.get("text") or "")[:80],
+            )
 
         # 6. 构建事件
         event = DesktopAwarenessEvent(
@@ -359,7 +403,11 @@ class _AwarenessWorker(QObject):
 
         # 9. 通知主线程（通过信号，Qt 自动排队到主线程）
         self.event_ready.emit(event)
-        logger.info("桌面感知：新事件已生成")
+        total_elapsed = (_time.monotonic() - cycle_start) * 1000
+        logger.info(
+            "桌面感知：事件已提交主线程 [gen=%d] 总耗时 %.0fms",
+            self._token.generation, total_elapsed,
+        )
 
     def _capture_screenshot(self) -> Optional[ScreenShot]:
         """
@@ -376,16 +424,16 @@ class _AwarenessWorker(QObject):
             shot = vision.capture()
             if shot.success:
                 return shot
-            logger.debug(
+            logger.info(
                 "桌面感知：截图失败（%s）",
                 shot.error or "未知原因",
             )
             return None
         except PermissionError as exc:
-            logger.debug("桌面感知：授权拒绝（DV 关闭或未注册）：%s", exc)
+            logger.info("桌面感知：授权拒绝（DV 关闭或未注册）：%s", exc)
             return None
         except Exception as exc:
-            logger.debug("桌面感知：截图失败：%s", exc)
+            logger.warning("桌面感知：截图异常：%s", exc)
             return None
 
     @staticmethod
@@ -408,7 +456,7 @@ class _AwarenessWorker(QObject):
 
             _dv_ok, _dv_reason = check()
             if not _dv_ok:
-                logger.debug(
+                logger.info(
                     "桌面感知：分析阶段 DV 授权已关闭（%s），跳过上传。",
                     _dv_reason,
                 )
@@ -430,6 +478,7 @@ class _AwarenessWorker(QObject):
                     "如果画面没有明显变化，返回 '无明显变化'。"
                     "只描述事实，不推测意图。"
                 ),
+                timeout=ANALYSIS_TIMEOUT_SECONDS,  # 防止网络超时阻塞 worker
                 user_confirmed=True,  # 内部使用，不对外暴露
             )
 
@@ -777,7 +826,7 @@ class DesktopAwareness:
         """
         # 守卫 1：已停止状态
         if self._state.is_stopped:
-            logger.debug(
+            logger.info(
                 "桌面感知：事件被丢弃（已停止）gen=%d",
                 event.worker_token.generation if event.worker_token else -1,
             )
@@ -789,7 +838,7 @@ class DesktopAwareness:
             and event.worker_token is not None
             and event.worker_token.generation != self._current_token.generation
         ):
-            logger.debug(
+            logger.info(
                 "桌面感知：事件被丢弃（旧 worker 延迟）"
                 "event_gen=%d current_gen=%d",
                 event.worker_token.generation,
@@ -809,7 +858,29 @@ class DesktopAwareness:
             if self._on_state_change is not None:
                 self._on_state_change(self._state)
         except Exception as exc:
-            logger.warning("桌面感知：on_state_change 回调异常：%s", exc)
+            logger.warning("桌面感知：状态变更回调异常：%s", exc)
+
+    def summary(self) -> dict[str, Any]:
+        """返回当前引擎状态的摘要，供诊断使用。"""
+        return {
+            "state": self._state.value,
+            "is_running": self._state.is_running,
+            "is_paused": self._state.is_paused,
+            "is_stopped": self._state.is_stopped,
+            "interval_seconds": self._interval,
+            "has_ai_client": self._ai_client is not None,
+            "worker_alive": (
+                self._worker is not None
+                and getattr(
+                    getattr(self._worker, '_thread', None),
+                    'isRunning', lambda: False
+                )()
+            ) if self._worker else False,
+            "thread_alive": (
+                self._thread.isRunning()
+                if self._thread is not None else False
+            ),
+        }
 
     # ── 析构保护 ────────────────────────────────────────────────
 

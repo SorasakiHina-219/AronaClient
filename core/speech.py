@@ -1,4 +1,4 @@
-﻿# core/speech.py
+# core/speech.py
 # AronaClient V0.1
 # 语音识别模块
 

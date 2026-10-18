@@ -1,0 +1,36 @@
+﻿python.exe : test_lambda_connection_not_direct_method_ref (__main__.TestSettingsDialogFix.test_lambda_connection_not_di
+rect_method_ref)
+所在位置 行:3 字符: 11
++ $output = & "C:\Users\HINA\AronaClient\.venv\Scripts\python.exe" "C:\ ...
++           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (test_lambda_con...ect_method_ref):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ȷ�Ͽ������ӵ��� lambda ����ֱ�ӷ������á� ... ok
+test_no_attribute_error_on_creation (__main__.TestSettingsDialogFix.test_no_attribute_error_on_creation) ... ok
+test_signal_exists (__main__.TestSettingsDialogFix.test_signal_exists) ... ok
+test_a_api_receives_isolated_context (__main__.TestChatHistoryIsolation.test_a_api_receives_isolated_context)
+A. ���͸� API ���Ƕ����б������ self.messages ���á� ... ok
+test_a_save_method_not_called (__main__.TestChatHistoryIsolation.test_a_save_method_not_called)
+A. ��֤ _save_current_session δ�����á� ... ok
+test_a_success_call_does_not_pollute_messages (__main__.TestChatHistoryIsolation.test_a_success_call_does_not_pollute_m
+essages)
+A. ��֪����ɹ���messages ���䡣 ... ok
+test_b_failure_does_not_pollute (__main__.TestChatHistoryIsolation.test_b_failure_does_not_pollute)
+B. ��֪����ʧ�ܣ�messages �ͻỰ���䡣 ... ok
+test_c_default_behavior_unchanged (__main__.TestChatHistoryIsolation.test_c_default_behavior_unchanged)
+C. ��ͨ���죨Ĭ�� save_to_session=True����Ϊ���䡣 ... ok
+test_c_session_saved_on_normal_chat (__main__.TestChatHistoryIsolation.test_c_session_saved_on_normal_chat)
+C. ��ͨ����ʱ _save_current_session �����á� ... ok
+test_d_session_switch_during_awareness (__main__.TestChatHistoryIsolation.test_d_session_switch_during_awareness)
+D. �Ự�л�ʱ��֪����д�����Ự�� ... ok
+test_completed_thread_cleanup (__main__.TestThreadLifecycle.test_completed_thread_cleanup)
+������߳�����ȷ����� ... �����֪���߳�δ�� 2000ms ���˳����������õȴ����ա�
+�����֪�����ڹر�ʱ��֪�߳��������У������ӳ��˳���
+ok
+test_empty_list_no_error (__main__.TestThreadLifecycle.test_empty_list_no_error)
+���б���������رա� ... QThread::wait: Thread tried to wait on itself
+�����֪���߳�δ�� 2000ms ���˳����������õȴ����ա�
+QThread: Destroyed while thread '' is still running
+�����֪���߳�δ�� 2000ms ���˳����������õȴ����ա�
+�����֪�����ڹر�ʱ��֪�߳��������У������ӳ��˳���

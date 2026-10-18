@@ -36,6 +36,15 @@ env/
 .env/
 
 # ============================================
+# 环境变量文件（可能包含 API Key 等敏感信息）
+# ============================================
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.template
+
+# ============================================
 # IDE 配置
 # ============================================
 .vscode/
@@ -138,6 +147,8 @@ test_*.py
 *_attack*.py
 *_cases.py
 *_mock*.py
+!tests/
+!tests/**/*.py
 *_regression*.py
 *_repro*.py
 
@@ -187,3 +198,4 @@ _f5fix_backup_*
 # main.py
 # requirements.txt
 # data/appearance/*.json (外观配置)
+

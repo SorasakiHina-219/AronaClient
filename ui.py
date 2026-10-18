@@ -670,6 +670,52 @@ class SpeechWorker(QObject):
 
 
 # ============================================================
+# 桌面感知主动回复后台任务
+# ============================================================
+
+class AwarenessReplyWorker(QObject):
+    """
+    将桌面感知事件提交给 AI，获取主动回复。
+
+    复用现有 AIClient 的 send_message 接口，
+    与 AIWorker 使用相同的线程管理模式。
+    """
+
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        ai_client,
+        awareness_description,
+    ):
+        super().__init__()
+        self.ai_client = ai_client
+        self.awareness_description = awareness_description
+
+    @Slot()
+    def run(self):
+        try:
+            # 将感知结果作为上下文发送给 AI，请求简短回应
+            message = (
+                "[桌面感知摘要]\n"
+                "{0}\n\n"
+                "请根据以上桌面观察结果，用一两句话给出相关提醒或建议。"
+                "如果 observation 中没有需要特别关注的变化，"
+                "可以简短回应 '一切正常'。".format(
+                    self.awareness_description
+                )
+            )
+            result = self.ai_client.send_message(
+                message,
+                save_to_session=False,
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ============================================================
 # 设置窗口
 # ============================================================
 
@@ -677,6 +723,7 @@ class SettingsDialog(QDialog):
 
     saved = Signal()
     appearance_saved = Signal(bool, int)
+    awareness_toggled = Signal(bool)
 
     def __init__(
         self,
@@ -2304,6 +2351,11 @@ class SettingsDialog(QDialog):
             )
             awareness_layout.addWidget(
                 self.awareness_enabled_checkbox
+            )
+            # 连接信号：切换开关时立即启停感知引擎，无需等保存。
+            # 通过信号通知主窗口（SettingsDialog 不直接持有感知引擎）。
+            self.awareness_enabled_checkbox.toggled.connect(
+                lambda checked: self.awareness_toggled.emit(checked)
             )
 
             # 间隔设置
@@ -3942,6 +3994,8 @@ class AronaUI(QMainWindow):
         self._awareness_active = False
         self._awareness_init_done = False
         self._desktop_vision_busy = False  # 防止重复触发截图分析任务
+        self._awareness_reply_busy = False  # 防止重复提交 AI 回复请求
+        self.awareness_reply_threads = []  # 追踪感知回复线程
 
         self.speech_thread = None
         self.speech_worker = None
@@ -7327,6 +7381,19 @@ class AronaUI(QMainWindow):
                     self.ai_client,
                     self,
                 )
+                # 将对话框的感知开关信号连接到主窗口的处理逻辑。
+                dialog.awareness_toggled.connect(
+                    self._on_awareness_toggled
+                )
+                # 同步开关初始状态：以当前设置值为准，反映主窗口实际状态。
+                if hasattr(dialog, "awareness_enabled_checkbox"):
+                    aw_settings = (
+                        self.ai_client.settings.settings
+                        .get("desktop_awareness", {})
+                    )
+                    dialog.awareness_enabled_checkbox.setChecked(
+                        bool(aw_settings.get("enabled", False))
+                    )
             finally:
                 _t_a1 = _t.monotonic()
                 _diag["dialog_create_ms"] = (_t_a1 - _t_a0) * 1000
@@ -7983,6 +8050,11 @@ class AronaUI(QMainWindow):
         """
         感知引擎回调：当检测到重要变化时调用。
         在主线程安全执行。
+
+        行为：
+          1. 添加系统通知消息（区分于 AI 回复）
+          2. 触发 AI 主动回复（非阻塞，通过 AwarenessReplyWorker）
+          3. 更新状态栏
         """
         if not hasattr(self, "stage_status"):
             return
@@ -7991,17 +8063,103 @@ class AronaUI(QMainWindow):
         if not description:
             return
 
-        # 发送到聊天消息
+        logger.info(
+            "桌面感知：触发提醒，描述=%s", description[:80]
+        )
+
+        # 1. 添加系统通知消息（带标记，区别于 AI 回复）
         self.add_message(
             "assistant",
             f"[桌面感知] {description}",
         )
 
-        # 更新状态栏
+        # 2. 触发 AI 主动回复（不阻塞主线程）
+        if not self._awareness_reply_busy:
+            self._submit_awareness_reply(description)
+        else:
+            logger.info(
+                "桌面感知：AI 正在处理其他请求，跳过本次主动回复"
+            )
+
+        # 3. 更新状态栏
         state = self.desktop_awareness.state.value if self.desktop_awareness else "unknown"
         self.stage_status.setText(
             f"桌面感知活跃（{state}）"
         )
+
+    def _submit_awareness_reply(
+        self,
+        description: str,
+    ) -> None:
+        """
+        提交桌面感知事件给 AI 进行主动回复。
+        非阻塞：在后台线程执行，结果通过信号回调。
+        """
+        self._awareness_reply_busy = True
+        self.stage_status.setText(
+            "桌面感知：Arona 正在思考……"
+        )
+        logger.info("桌面感知：提交 AI 回复请求")
+
+        thread = QThread(self)
+        worker = AwarenessReplyWorker(
+            self.ai_client,
+            description,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        worker.finished.connect(self._on_awareness_reply_finished)
+        worker.error.connect(self._on_awareness_reply_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.awareness_reply_threads.append(
+            (thread, worker)
+        )
+        thread.finished.connect(
+            lambda pair=(thread, worker):
+            self._remove_awareness_reply_thread(pair)
+        )
+
+        thread.start()
+
+    def _on_awareness_reply_finished(
+        self,
+        result: str,
+    ) -> None:
+        """AI 主动回复完成，显示在聊天中。"""
+        self._awareness_reply_busy = False
+        logger.info("桌面感知：AI 回复完成")
+        self.add_message(
+            "assistant",
+            result,
+        )
+        self._update_awareness_status_ui()
+
+    def _on_awareness_reply_error(
+        self,
+        error: str,
+    ) -> None:
+        """AI 主动回复失败。"""
+        self._awareness_reply_busy = False
+        logger.warning("桌面感知：AI 回复失败：%s", error)
+        self.add_message(
+            "assistant",
+            f"[桌面感知] AI 回复失败：{error}",
+        )
+        self._update_awareness_status_ui()
+
+    def _remove_awareness_reply_thread(
+        self,
+        thread_pair,
+    ) -> None:
+        """清理已结束的感知回复线程。"""
+        if thread_pair in self.awareness_reply_threads:
+            self.awareness_reply_threads.remove(thread_pair)
 
     def _on_awareness_state_change(
         self,
@@ -8046,6 +8204,41 @@ class AronaUI(QMainWindow):
             self.desktop_awareness = None
             self._awareness_active = False
             self._awareness_init_done = False
+
+    def _on_awareness_toggled(self, checked: bool) -> None:
+        """
+        桌面自主感知开关切换回调。
+        开启时启动或恢复引擎，关闭时暂停引擎。
+        幂等：重复操作不会重复创建线程。
+        """
+        if checked:
+            # 开启：确保引擎在运行
+            if self.desktop_awareness is None:
+                # 从未初始化过，执行完整初始化
+                self._init_desktop_awareness()
+            elif self.desktop_awareness.is_stopped:
+                # 已停止（如 DV 曾关闭后重新开启），重新初始化
+                self._init_desktop_awareness()
+            elif self.desktop_awareness.is_paused:
+                # 已暂停，恢复
+                try:
+                    self.desktop_awareness.resume()
+                    self._awareness_active = True
+                    self._update_awareness_status_ui()
+                    logger.info("桌面感知：用户手动恢复")
+                except Exception as exc:
+                    logger.warning("桌面感知：恢复失败：%s", exc)
+            # else: 已在运行，无需操作
+        else:
+            # 关闭：暂停引擎（不销毁，保留状态以便恢复）
+            if self.desktop_awareness is not None and self.desktop_awareness.is_running:
+                try:
+                    self.desktop_awareness.pause()
+                    self._awareness_active = False
+                    self._update_awareness_status_ui()
+                    logger.info("桌面感知：用户手动暂停")
+                except Exception as exc:
+                    logger.warning("桌面感知：暂停失败：%s", exc)
 
     def refresh_avatar_widgets(
         self,
@@ -9465,6 +9658,37 @@ class AronaUI(QMainWindow):
                     targets.append(
                         (f"worker#{index}", pair[0])
                     )
+
+        except Exception as exc:
+
+            print(f'[Desktop Transparency] Error collecting worker_threads: {exc}')
+            import traceback
+            traceback.print_exc()
+
+        # 感知回复线程也纳入关闭流程。
+        try:
+
+            for index, pair in enumerate(
+                list(
+                    getattr(
+                        self,
+                        "awareness_reply_threads",
+                        [],
+                    )
+                )
+            ):
+
+                if isinstance(pair, (tuple, list)) and len(pair) >= 2:
+
+                    targets.append(
+                        (f"awareness_reply#{index}", pair[0])
+                    )
+
+        except Exception as exc:
+
+            print(f'[Desktop Transparency] Error collecting awareness_reply_threads: {exc}')
+            import traceback
+            traceback.print_exc()
 
         except Exception as exc:
 
