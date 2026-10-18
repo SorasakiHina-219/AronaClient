@@ -49,14 +49,30 @@ SMALL_BODY = b"SMALL-OK"
 
 
 class _Server:
-    """本地受控 HTTPS 服务器（127.0.0.1，随机端口，临时证书）。"""
+    """本地受控 HTTPS 服务器（127.0.0.1，随机端口，临时证书）。
 
-    def __init__(self, tmp_dir: Path):
+    参数：
+        expired: 为 True 时签发**已过期**的证书（not_after 在过去），
+                 用于验证 TLS 有效期校验真实生效。
+    """
+
+    def __init__(self, tmp_dir: Path, expired: bool = False):
         self.tmp_dir = tmp_dir
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         ca = trustme.CA()
-        cert = ca.issue_cert(HOSTNAME)
+
+        if expired:
+            import datetime
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            cert = ca.issue_cert(
+                HOSTNAME,
+                not_before=now - datetime.timedelta(days=30),
+                not_after=now - datetime.timedelta(days=1),
+            )
+        else:
+            cert = ca.issue_cert(HOSTNAME)
 
         self.cert_path = self.tmp_dir / "cert.pem"
         self.key_path = self.tmp_dir / "key.pem"
@@ -331,6 +347,119 @@ class TestRealTransport(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIsNone(result["path"])
         self.assertEqual(set(self.download_dir.glob("*")), before)
+
+
+@unittest.skipUnless(
+    HAS_TLS_TEST_DEPS, "需要 trustme 与 urllib3 才能运行真实传输测试"
+)
+class TestExpiredCertificate(unittest.TestCase):
+    """过期 TLS 证书必须被拒绝（真实握手，非 mock）。
+
+    证书由 trustme 签发、主机名匹配，但 not_after 已在过去。
+    验证点：
+        * 真实 TLS 握手因证书过期失败（错误信息含 expired）
+        * 下载器不把该请求报告为成功
+        * 不留下任何正式下载文件或临时文件
+        * 安全校验（DNS/URL）未被绕过
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = PROJECT_ROOT / "tests" / "_tmp_expired_cert"
+        cls.server = _Server(cls.tmp, expired=True)
+        cls.download_dir = cls.tmp / "downloads"
+        cls.download_dir.mkdir(parents=True, exist_ok=True)
+        cls.server.routes = {"/file.bin": (200, {}, b"MUST-NOT-DELIVER")}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _local_dns(self, hostname):
+        return {"success": True, "ip": "127.0.0.1"}
+
+    def test_real_tls_handshake_rejects_expired_cert(self):
+        """真实 TLS 握手因证书过期而失败。"""
+        pool = urllib3.HTTPSConnectionPool(
+            "127.0.0.1",
+            port=self.server.port,
+            assert_hostname=HOSTNAME,
+            server_hostname=HOSTNAME,
+            ca_certs=str(self.server.ca_path),
+            cert_reqs="CERT_REQUIRED",
+            timeout=5.0,
+            retries=False,
+        )
+        try:
+            with self.assertRaises(urllib3.exceptions.SSLError) as ctx:
+                pool.request(
+                    "GET", "/file.bin",
+                    headers={"Host": HOSTNAME},
+                    retries=False,
+                )
+            message = str(ctx.exception).lower()
+            self.assertIn(
+                "expired", message,
+                f"失败原因应为证书过期，实际：{message}",
+            )
+        finally:
+            pool.close()
+
+    def test_downloader_rejects_expired_cert(self):
+        """下载器对过期证书返回失败。"""
+        orig = urllib3.HTTPSConnectionPool
+
+        def patched(*args, **kwargs):
+            kwargs.setdefault("ca_certs", str(self.server.ca_path))
+            kwargs.setdefault("cert_reqs", "CERT_REQUIRED")
+            return orig(*args, **kwargs)
+
+        urllib3.HTTPSConnectionPool = patched
+        try:
+            d = Downloader(download_root=self.download_dir)
+            with patch.object(
+                d, "_resolve_and_validate_dns", side_effect=self._local_dns
+            ):
+                result = d.download(self.server.url("/file.bin"))
+        finally:
+            urllib3.HTTPSConnectionPool = orig
+
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["path"])
+        self.assertIsNone(result["size"])
+        self.assertIsNone(result["sha256"])
+
+    def test_expired_cert_leaves_no_file(self):
+        """过期证书失败后不残留任何文件。"""
+        orig = urllib3.HTTPSConnectionPool
+
+        def patched(*args, **kwargs):
+            kwargs.setdefault("ca_certs", str(self.server.ca_path))
+            kwargs.setdefault("cert_reqs", "CERT_REQUIRED")
+            return orig(*args, **kwargs)
+
+        urllib3.HTTPSConnectionPool = patched
+        try:
+            d = Downloader(download_root=self.download_dir)
+            before = set(self.download_dir.glob("*"))
+            with patch.object(
+                d, "_resolve_and_validate_dns", side_effect=self._local_dns
+            ):
+                d.download(self.server.url("/file.bin"))
+            after = set(self.download_dir.glob("*"))
+        finally:
+            urllib3.HTTPSConnectionPool = orig
+
+        self.assertEqual(before, after, "失败时不得写入任何文件")
+        self.assertEqual(list(self.download_dir.glob("*.tmp")), [])
+
+    def test_expired_cert_does_not_bypass_dns_checks(self):
+        """过期证书路径不会绕过 DNS 安全校验。"""
+        d = Downloader(download_root=self.download_dir)
+        # 不 patch DNS：expired.example.com 无法解析为公网地址，应被拒绝
+        result = d.download(self.server.url("/file.bin"))
+        self.assertFalse(result["success"])
 
 
 if __name__ == "__main__":
