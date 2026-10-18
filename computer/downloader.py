@@ -5,6 +5,8 @@
     * 从指定 URL 下载文件
     * 逐跳校验重定向，拒绝任何非 HTTPS 跳转
     * 拒绝私有/回环/链路本地 IP 地址
+    * DNS 解析失败时 fail-closed
+    * 混合公网/私网地址时拒绝
     * 清理文件名，禁止路径穿越
     * 设置下载大小限制和网络超时
     * 默认保存到用户下载目录的独立子目录
@@ -13,11 +15,23 @@
 安全约束：
     * 仅允许 HTTPS，且每个重定向目标也必须为 HTTPS
     * 拒绝私有 IP、回环地址、链路本地地址
+    * DNS 解析失败时 fail-closed（拒绝下载）
+    * 解析结果为混合公网/私网地址时拒绝
     * 文件大小上限：100MB（可配置）
     * 网络超时：30秒
     * 文件名清理防止路径穿越
     * 不自动解压、不自动运行
     * 临时文件在失败时自动清理
+
+已知限制：
+    * httpx2 内部使用标准 socket 进行 DNS 解析，无法在客户端层面强制绑定到
+      已验证的 IP 地址。因此无法完全防御 DNS 重绑攻击（DNS rebinding）。
+      本实现通过以下措施降低风险：
+      - 每次请求前重新解析 DNS 并校验所有返回地址
+      - DNS 解析失败时 fail-closed
+      - 混合公网/私网地址结果时拒绝
+      - 限制重定向次数并检测循环
+    * 如需完全防御 DNS 重绑，需使用支持自定义 DNS 解析和连接绑定的 HTTP 库。
 """
 
 from __future__ import annotations
@@ -71,6 +85,10 @@ class SizeExceededError(DownloadError):
     """下载大小超出限制。"""
 
 
+class DnsResolutionError(DownloadError):
+    """DNS 解析失败或结果不可信。"""
+
+
 class Downloader:
     """
     受控文件下载器。
@@ -79,9 +97,14 @@ class Downloader:
         * 只下载，不安装、不执行
         * 仅 HTTPS，逐跳校验，拒绝降级
         * 拒绝私有/回环/链路本地 IP
+        * DNS 解析失败时 fail-closed
+        * 混合公网/私网地址结果时拒绝
         * 文件名安全清理，防路径穿越
         * 大小限制，防止磁盘耗尽
         * 临时文件失败时自动清理
+
+    已知限制：
+        * 无法完全防御 DNS 重绑攻击（见模块文档）
     """
 
     def __init__(
@@ -135,6 +158,31 @@ class Downloader:
                 final_url = current_url
 
                 for redirect_count in range(self._max_redirects + 1):
+                    # 每次请求前重新解析 DNS 并校验
+                    hostname = self._get_hostname(current_url)
+                    if hostname is None:
+                        return {
+                            "success": False,
+                            "url": url,
+                            "path": None,
+                            "size": None,
+                            "sha256": None,
+                            "error": "无法从 URL 提取主机名。",
+                            "message": "下载失败：URL 格式无效。",
+                        }
+
+                    dns_result = self._resolve_and_validate_dns(hostname)
+                    if not dns_result["success"]:
+                        return {
+                            "success": False,
+                            "url": current_url,
+                            "path": None,
+                            "size": None,
+                            "sha256": None,
+                            "error": dns_result["error"],
+                            "message": dns_result["message"],
+                        }
+
                     response = client.get(current_url)
 
                     # 检查是否是重定向
@@ -283,6 +331,16 @@ class Downloader:
                 "error": f"超时：{exc}",
                 "message": "下载失败：请求超时。",
             }
+        except DnsResolutionError as exc:
+            return {
+                "success": False,
+                "url": url,
+                "path": None,
+                "size": None,
+                "sha256": None,
+                "error": f"DNS 校验失败：{exc}",
+                "message": "下载失败：DNS 解析结果不安全。",
+            }
         except Exception as exc:
             return {
                 "success": False,
@@ -328,8 +386,10 @@ class Downloader:
             if not str(resolved_save).startswith(
                 str(self._download_root.resolve())
             ):
-                os.close(temp_fd) if not os.devnull else None
-                os.unlink(temp_path)
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
                 return {
                     "success": False,
                     "url": url,
@@ -469,18 +529,110 @@ class Downloader:
 
         return {"success": True, "url": url}
 
-    def _is_private_or_reserved_ip(self, hostname):
+    def _get_hostname(self, url):
+        """从 URL 中提取主机名。"""
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return parsed.hostname
+
+    def _resolve_and_validate_dns(self, hostname):
         """
-        检查主机名是否解析为私有/回环/链路本地 IP。
+        解析 DNS 并校验所有返回的 IP 地址。
+
+        返回：
+            {"success": bool, "error": str|None, "message": str}
+
+        安全策略：
+            - DNS 解析失败 → fail-closed（拒绝）
+            - 空解析结果 → fail-closed（拒绝）
+            - 任何 IP 为私有/回环/链路本地/保留/多播 → 拒绝
+            - 混合公网+私网地址 → 拒绝（DNS 重绑嫌疑）
         """
-        # 先尝试直接解析
         try:
             addr_info = socket.getaddrinfo(
                 hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
             )
         except socket.gaierror:
-            # 解析失败，可能是域名，放行（DNS 可能指向不同地址）
-            return False
+            # DNS 解析失败 → fail-closed
+            return {
+                "success": False,
+                "error": f"DNS 解析失败：{hostname}",
+                "message": "下载失败：无法解析主机名。",
+            }
+
+        if not addr_info:
+            # 空结果 → fail-closed
+            return {
+                "success": False,
+                "error": f"DNS 解析返回空结果：{hostname}",
+                "message": "下载失败：DNS 解析无结果。",
+            }
+
+        has_public = False
+        has_private = False
+
+        for info in addr_info:
+            ip_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                # 无效的 IP 地址 → fail-closed
+                return {
+                    "success": False,
+                    "error": f"DNS 返回无效 IP 地址：{ip_str}",
+                    "message": "下载失败：DNS 解析结果异常。",
+                }
+
+            is_safe = (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+            )
+
+            if is_safe:
+                has_private = True
+            else:
+                has_public = True
+
+        # 混合地址 → 拒绝（疑似 DNS 重绑）
+        if has_public and has_private:
+            return {
+                "success": False,
+                "error": (
+                    f"DNS 解析返回混合地址（公网+私有）：{hostname}"
+                ),
+                "message": "下载失败：DNS 解析结果包含混合地址。",
+            }
+
+        # 全部为私有/不安全地址 → 拒绝
+        if has_private and not has_public:
+            return {
+                "success": False,
+                "error": f"DNS 解析所有地址均为私有/保留：{hostname}",
+                "message": "下载失败：目标地址为内网地址。",
+            }
+
+        # 全部为公网地址 → 放行
+        return {"success": True}
+
+    def _is_private_or_reserved_ip(self, hostname):
+        """
+        检查主机名是否解析为私有/回环/链路本地 IP。
+        用于重定向校验场景。
+        """
+        try:
+            addr_info = socket.getaddrinfo(
+                hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        except socket.gaierror:
+            # DNS 解析失败 → fail-closed
+            return True
+
+        if not addr_info:
+            # 空结果 → fail-closed
+            return True
 
         for info in addr_info:
             ip_str = info[4][0]
@@ -495,14 +647,8 @@ class Downloader:
                 ):
                     return True
             except ValueError:
-                continue
-
-        # 如果是 IPv6 压缩格式的特殊地址
-        try:
-            if ipaddress.ip_address(hostname).is_private:
+                # 无效 IP → fail-closed
                 return True
-        except ValueError:
-            pass
 
         return False
 
@@ -537,17 +683,6 @@ class Downloader:
             name = path_part.split("/")[-1]
             if name:
                 safe = self._sanitize_filename(name)
-                if safe:
-                    return safe
-
-        content_disp = ""  # Not available without response object
-        if content_disp and "filename" in content_disp:
-            import re as _re
-            match = _re.search(
-                r'filename["\']?=?["\']?([^";\n]+)', content_disp
-            )
-            if match:
-                safe = self._sanitize_filename(match.group(1).strip())
                 if safe:
                     return safe
 

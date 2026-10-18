@@ -1,7 +1,7 @@
 
 """AronaClient V0.2 桌面操作能力 — 安全修复与综合测试。
 
-覆盖 P1 修复验证和七类安全测试场景。
+覆盖 P1 修复验证、DNS 安全加固和七类安全测试场景。
 所有测试使用 Mock 隔离，不产生真实外部副作用。
 """
 
@@ -31,7 +31,7 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
         """HTTP URL 必须被拒绝。"""
         result = self.downloader.download('http://example.com/file.zip')
         self.assertFalse(result['success'])
-        self.assertIn('HTTPS', result['message'])
+        self.assertIn('HTTPS', result['error'] or '')
 
     def test_empty_url_rejected(self):
         """空 URL 必须被拒绝。"""
@@ -40,56 +40,77 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
 
     def test_redirect_to_http_blocked(self):
         """重定向到 HTTP 必须被拒绝。"""
-        with patch('computer.downloader.httpx') as mock_httpx:
-            # First response: 302 redirect to HTTP
-            mock_response = MagicMock()
-            mock_response.status_code = 302
-            mock_response.headers = {'location': 'http://evil.com/file.zip'}
-            mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            # Mock DNS resolution for the initial URL and redirect target
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
+            ]
+            with patch('computer.downloader.httpx') as mock_httpx:
+                mock_response = MagicMock()
+                mock_response.status_code = 302
+                mock_response.headers = {'location': 'http://evil.com/file.zip'}
+                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
 
-            result = self.downloader.download('https://example.com/redirect')
-            self.assertFalse(result['success'])
-            self.assertIn('重定向', result['message'])
+                result = self.downloader.download('https://example.com/redirect')
+                self.assertFalse(result['success'])
+                # Should be blocked because redirect target is HTTP
+                self.assertIn('不安全', result['message'])
 
     def test_redirect_to_private_ip_blocked(self):
         """重定向到私有 IP 必须被拒绝。"""
-        with patch('computer.downloader.httpx') as mock_httpx:
-            mock_response = MagicMock()
-            mock_response.status_code = 302
-            mock_response.headers = {'location': 'https://192.168.1.1/file.zip'}
-            mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            # First call: initial URL resolves to public IP
+            # Second call: redirect target resolves to private IP
+            mock_dns.side_effect = [
+                [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))],
+                [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.1', 0))],
+            ]
+            with patch('computer.downloader.httpx') as mock_httpx:
+                mock_response = MagicMock()
+                mock_response.status_code = 302
+                mock_response.headers = {'location': 'https://192.168.1.1/file.zip'}
+                mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
 
-            result = self.downloader.download('https://example.com/redirect')
-            self.assertFalse(result['success'])
-            self.assertFalse(result['success'])
+                result = self.downloader.download('https://example.com/redirect')
+                self.assertFalse(result['success'])
+                self.assertIn('内网', result['message'])
 
     def test_redirect_loop_detected(self):
         """循环重定向必须被检测。"""
-        with patch('computer.downloader.httpx') as mock_httpx:
-            mock_response = MagicMock()
-            mock_response.status_code = 302
-            mock_response.headers = {'location': 'https://example.com/loop'}
-            mock_httpx.Client.return_value.__enter__.return_value.get.return_value = mock_response
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
+            ]
+            with patch('computer.downloader.httpx') as mock_httpx:
+                mock_response = MagicMock()
+                mock_response.status_code = 302
+                mock_response.headers = {'location': 'https://example.com/loop'}
+                mock_httpx.Client.return_value.__enter__.return_value.get.side_effect = [
+                    mock_response, mock_response, mock_response,
+                    mock_response, mock_response, mock_response,
+                ]
 
-            # Same URL redirects to itself
-            result = self.downloader.download('https://example.com/loop')
-            # Should eventually fail due to loop detection or redirect limit
-            self.assertFalse(result['success'])
+                result = self.downloader.download('https://example.com/loop')
+                self.assertFalse(result['success'])
+                self.assertIn('重定向', result['message'])
 
     def test_max_redirects_enforced(self):
         """重定向次数上限必须生效。"""
-        with patch('computer.downloader.httpx') as mock_httpx:
-            def make_redirect_response(*args, **kwargs):
-                resp = MagicMock()
-                resp.status_code = 302
-                resp.headers = {'location': 'https://example.com/next'}
-                return resp
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
+            ]
+            with patch('computer.downloader.httpx') as mock_httpx:
+                def make_redirect(*args, **kwargs):
+                    resp = MagicMock()
+                    resp.status_code = 302
+                    resp.headers = {'location': 'https://example.com/next'}
+                    return resp
+                mock_httpx.Client.return_value.__enter__.return_value.get.side_effect = make_redirect
 
-            mock_httpx.Client.return_value.__enter__.return_value.get.side_effect = make_redirect_response
-
-            result = self.downloader.download('https://example.com/start')
-            self.assertFalse(result['success'])
-            self.assertIn('重定向', result['message'])
+                result = self.downloader.download('https://example.com/start')
+                self.assertFalse(result['success'])
+                self.assertIn('重定向', result['message'])
 
     def test_filename_sanitization(self):
         """文件名中的危险字符必须被清理。"""
@@ -105,7 +126,92 @@ class TestDownloaderRedirectSafety(unittest.TestCase):
 
 
 # ============================================================
-# Test 2: 应用启动安全
+# Test 2: DNS 安全加固
+# ============================================================
+class TestDownloaderDNSSafety(unittest.TestCase):
+    """下载器 DNS 安全测试。"""
+
+    def setUp(self):
+        from computer.downloader import Downloader
+        self.downloader = Downloader()
+
+    def test_dns_failure_fail_closed(self):
+        """DNS 解析失败时必须 fail-closed。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.side_effect = socket.gaierror("Name or service not known")
+            result = self.downloader.download('https://nonexistent.invalid/file.zip')
+            self.assertFalse(result['success'])
+            self.assertIn('DNS', result['error'] or '')
+
+    def test_dns_empty_result_fail_closed(self):
+        """DNS 返回空结果时必须 fail-closed。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = []
+            result = self.downloader.download('https://empty.example.com/file.zip')
+            self.assertFalse(result['success'])
+            self.assertIn('DNS', result['error'] or '')
+
+    def test_dns_private_ip_rejected(self):
+        """DNS 解析到私有 IP 时必须拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0))
+            ]
+            result = self.downloader.download('https://internal.example.com/file.zip')
+            self.assertFalse(result['success'])
+
+    def test_dns_loopback_rejected(self):
+        """DNS 解析到回环地址时必须拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 0))
+            ]
+            result = self.downloader.download('https://localhost/file.zip')
+            self.assertFalse(result['success'])
+
+    def test_dns_link_local_rejected(self):
+        """DNS 解析到链路本地地址时必须拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('169.254.1.1', 0))
+            ]
+            result = self.downloader.download('https://link-local.example.com/file.zip')
+            self.assertFalse(result['success'])
+
+    def test_dns_mixed_addresses_rejected(self):
+        """DNS 返回混合公网/私网地址时必须拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0)),  # public
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.1', 0)),     # private
+            ]
+            result = self.downloader.download('https://mixed.example.com/file.zip')
+            self.assertFalse(result['success'])
+            self.assertIn('混合', result['error'] or '')
+
+    def test_dns_invalid_ip_rejected(self):
+        """DNS 返回无效 IP 地址时必须拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('not-an-ip', 0))
+            ]
+            result = self.downloader.download('https://invalid.example.com/file.zip')
+            self.assertFalse(result['success'])
+            self.assertIn('DNS', result['error'] or '')
+
+    def test_dns_public_ip_allowed(self):
+        """DNS 解析到合法公网 IP 时不应在 DNS 阶段被拒绝。"""
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 0))
+            ]
+            # Test the DNS validation method directly
+            result = self.downloader._resolve_and_validate_dns('example.com')
+            self.assertTrue(result['success'])
+
+
+# ============================================================
+# Test 3: 应用启动安全
 # ============================================================
 class TestAppLauncherSecurity(unittest.TestCase):
     """应用启动安全测试。"""
@@ -124,10 +230,8 @@ class TestAppLauncherSecurity(unittest.TestCase):
 
     def test_legitimate_apps_allowed(self):
         """合法应用应可启动（或返回找不到）。"""
-        # notepad might exist, calc might exist - just check they're not blocked by security
         for name in ['notepad', 'calc']:
             result = self.launcher.launch(name)
-            # Should NOT be blocked by security policy
             if not result['success']:
                 self.assertNotIn('安全', result['message'],
                     f'{name} should not be blocked by security policy')
@@ -160,7 +264,7 @@ class TestAppLauncherSecurity(unittest.TestCase):
 
 
 # ============================================================
-# Test 3: URL 凭据拒绝
+# Test 4: URL 凭据拒绝
 # ============================================================
 class TestBrowserCredentialBlocking(unittest.TestCase):
     """浏览器 URL 凭据检查测试。"""
@@ -197,7 +301,7 @@ class TestBrowserCredentialBlocking(unittest.TestCase):
 
 
 # ============================================================
-# Test 4: 工具调用参数校验
+# Test 5: 工具调用参数校验
 # ============================================================
 class TestToolCallValidation(unittest.TestCase):
     """工具调用参数校验测试。"""
@@ -214,29 +318,24 @@ class TestToolCallValidation(unittest.TestCase):
 
     def test_missing_required_param(self):
         """缺少必需参数应返回失败（由 handler 处理）。"""
-        # open_url requires 'url' parameter
         result = self.registry.call_tool('open_url', {})
-        # Should fail gracefully, not crash
         self.assertIn('success', result)
 
     def test_wrong_param_type(self):
         """错误参数类型应被捕获。"""
         result = self.registry.call_tool('open_url', {'url': 12345})
-        # Should handle non-string URL gracefully
         self.assertIn('success', result)
 
     def test_invalid_json_arguments(self):
         """非法 JSON 参数应被容错处理。"""
-        # Simulate what AIClient does with invalid JSON
         from computer.tool_registry import ToolRegistry
         registry = ToolRegistry()
-        # Direct handler call with invalid args
         result = registry._browser.open_url('https://example.com')
         self.assertIn('success', result)
 
 
 # ============================================================
-# Test 5: 工具结果安全序列化
+# Test 6: 工具结果安全序列化
 # ============================================================
 class TestToolResultSerialization(unittest.TestCase):
     """工具结果安全序列化测试。"""
@@ -248,7 +347,6 @@ class TestToolResultSerialization(unittest.TestCase):
     def test_special_chars_in_result(self):
         """结果中的特殊字符应被安全序列化。"""
         result = self.registry.call_tool('open_url', {'url': 'https://example.com'})
-        # Should be convertible to string without issues
         msg = str(result.get('message', ''))
         self.assertIsInstance(msg, str)
 
@@ -267,7 +365,7 @@ class TestToolResultSerialization(unittest.TestCase):
 
 
 # ============================================================
-# Test 6: 五轮工具调用边界
+# Test 7: 五轮工具调用边界
 # ============================================================
 class TestToolCallRoundLimit(unittest.TestCase):
     """五轮工具调用上限测试。"""
@@ -281,8 +379,6 @@ class TestToolCallRoundLimit(unittest.TestCase):
 
     def test_loop_breaks_on_no_tool_calls(self):
         """无 tool_calls 时应退出循环。"""
-        # This is verified by code structure:
-        # if not tool_calls: break
         from core.ai_client import AIClient
         import inspect
         source = inspect.getsource(AIClient.send_message)
@@ -291,7 +387,7 @@ class TestToolCallRoundLimit(unittest.TestCase):
 
 
 # ============================================================
-# Test 7: 并发工具调用安全
+# Test 8: 并发工具调用安全
 # ============================================================
 class TestConcurrentToolSafety(unittest.TestCase):
     """并发工具调用安全测试。"""
@@ -302,7 +398,6 @@ class TestConcurrentToolSafety(unittest.TestCase):
 
     def test_parallel_tool_calls_handled(self):
         """并行工具调用应逐个执行。"""
-        # Verify the code iterates over tool_calls sequentially
         from core.ai_client import AIClient
         import inspect
         source = inspect.getsource(AIClient.send_message)
@@ -310,10 +405,8 @@ class TestConcurrentToolSafety(unittest.TestCase):
 
     def test_tool_result_does_not_leak_state(self):
         """工具结果不应串扰到其他工具。"""
-        # Each tool call is independent
         result1 = self.registry.call_tool('open_url', {'url': 'https://example.com'})
         result2 = self.registry.call_tool('launch_app', {'name_or_path': 'nonexistent_app_xyz'})
-        # Both should be independent
         self.assertIn('success', result1)
         self.assertIn('success', result2)
 
@@ -326,17 +419,20 @@ class TestSecurityRegression(unittest.TestCase):
 
     def test_no_shell_true_in_launcher(self):
         from computer.app_launcher import AppLauncher
+        import inspect
         source = inspect.getsource(AppLauncher.launch)
         self.assertNotIn('shell=True', source)
 
     def test_no_exec_in_browser(self):
         from computer.web_browser import BrowserController
+        import inspect
         source = inspect.getsource(BrowserController.open_url)
         self.assertNotIn('eval', source)
         self.assertNotIn('exec', source)
 
     def test_downloader_no_auto_execute(self):
         from computer.downloader import Downloader
+        import inspect
         source = inspect.getsource(Downloader.download)
         self.assertNotIn('subprocess.run', source)
         self.assertNotIn('os.system', source)
@@ -352,10 +448,43 @@ class TestSecurityRegression(unittest.TestCase):
         self.assertIn('cmd.exe', DANGEROUS_EXECUTABLE_NAMES)
         self.assertIn('powershell.exe', DANGEROUS_EXECUTABLE_NAMES)
 
+    def test_dns_fail_closed_on_gaierror(self):
+        """DNS gaierror 应导致 fail-closed。"""
+        import socket
+        from computer.downloader import Downloader
+        d = Downloader()
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.side_effect = socket.gaierror("fail")
+            result = d._resolve_and_validate_dns("example.com")
+            self.assertFalse(result['success'])
+
+    def test_dns_fail_closed_on_empty_result(self):
+        """DNS 空结果应导致 fail-closed。"""
+        from computer.downloader import Downloader
+        d = Downloader()
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = []
+            result = d._resolve_and_validate_dns("example.com")
+            self.assertFalse(result['success'])
+
+    def test_dns_mixed_addresses_rejected(self):
+        """混合公网/私网地址应被拒绝。"""
+        import socket
+        from computer.downloader import Downloader
+        d = Downloader()
+        with patch('computer.downloader.socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.1', 0)),
+            ]
+            result = d._resolve_and_validate_dns("mixed.example.com")
+            self.assertFalse(result['success'])
+
 
 # ============================================================
 # Run
 # ============================================================
 if __name__ == '__main__':
     import inspect
+    import socket
     unittest.main(verbosity=2)
