@@ -22,6 +22,8 @@ from core.desktop_vision import (
     set_desktop_vision_authorization,
 )
 
+from computer.tool_registry import ToolRegistry
+
 # 门禁留痕函数（下划线开头，仅模块内使用）
 from core.desktop_vision import (
     _note_desktop_vision_denied,
@@ -221,6 +223,9 @@ class AIClient:
         # 同样刻意用私有名保存：它是授权的唯一来源，
         # 如果允许外部替换，就等于允许伪造授权（第三轮审计 M-1）。
         self._task_manager = None
+
+        # Tool registry for desktop control (V0.2)
+        self._tool_registry = ToolRegistry()
 
         self.reload()
 
@@ -2092,18 +2097,62 @@ class AIClient:
             else [request_message]
         )
 
-        response = (
-            self.client.chat.completions.create(
-                model=request_model,
-                messages=context_messages,
-            )
-        )
+        # Tool calling support (V0.2)
+        #
+        # Loop: model returns tool_calls -> execute -> send results -> retry
+        MAX_TOOL_ROUNDS = 5
+        tools = None
+        if self._tool_registry and self._tool_registry.tool_count() > 0:
+            tools = self._tool_registry.get_tools()
 
-        answer = (
-            response.choices[0]
-            .message.content
-            or ""
-        )
+        final_answer = ''
+        for _round in range(MAX_TOOL_ROUNDS):
+            response = (
+                self.client.chat.completions.create(
+                    model=request_model,
+                    messages=context_messages,
+                    tools=tools,
+                )
+            )
+            choice = response.choices[0].message
+            tool_calls = getattr(choice, 'tool_calls', None) or []
+            if not tool_calls:
+                final_answer = choice.content or ''
+                break
+            # Build assistant message with tool_calls
+            assistant_msg = {
+                'role': 'assistant',
+                'content': choice.content or '',
+                'tool_calls': [
+                    {
+                        'id': tc.id,
+                        'type': 'function',
+                        'function': {
+                            'name': tc.function.name,
+                            'arguments': tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            context_messages.append(assistant_msg)
+            # Execute each tool call
+            for tc in tool_calls:
+                tool_name = tc.function.name
+                try:
+                    import json as _json
+                    tool_args = _json.loads(tc.function.arguments or '{}')
+                except (ValueError, TypeError):
+                    tool_args = {}
+                tool_result = self._tool_registry.call_tool(
+                    tool_name, tool_args
+                )
+                context_messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.id,
+                    'content': str(tool_result.get('message', '')),
+                })
+        answer = final_answer
 
         if save_to_session:
 
