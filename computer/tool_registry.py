@@ -170,6 +170,169 @@ class ToolRegistry:
             handler=self._downloader.download,
         )
 
+        # ----------------------------------------------------
+        # 只读桌面感知工具
+        # ----------------------------------------------------
+        #
+        # 这两个工具只读取桌面状态，不移动鼠标、不输入键盘、
+        # 不点击任何控件。它们与 open_url / launch_app / download_file
+        # 这类有副作用的工具在权限边界上明确分开：
+        #   * 只读工具仍然受 computer.desktop_access 门禁约束，
+        #     未授权时返回明确的失败信息，不会伪造桌面状态；
+        #   * 有副作用工具各自有独立的安全校验。
+        self.register(
+            schema=_make_tool_schema(
+                name="get_active_window",
+                description=(
+                    "读取当前前台活动窗口的信息（标题、进程名、"
+                    "窗口位置与尺寸）。只读操作，不会操作窗口。"
+                    "需要用户已开启桌面视觉授权。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            ),
+            handler=self._get_active_window_tool,
+        )
+
+        self.register(
+            schema=_make_tool_schema(
+                name="list_windows",
+                description=(
+                    "列出当前桌面上可见且有标题的窗口（最多 20 个，"
+                    "上限 200）。只读操作。"
+                    "不返回进程路径或窗口句柄等内部标识。"
+                    "需要用户已开启桌面视觉授权。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                "最多返回多少个窗口，默认 20，上限 200。"
+                            ),
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            ),
+            handler=self._list_windows_tool,
+        )
+
+    # ========================================================
+    # 只读桌面感知工具 handler
+    # ========================================================
+    #
+    # 统一返回 {success, result, error, message}，
+    # 与 ToolRegistry.call_tool 的标准化约定一致。
+    # 失败时绝不编造桌面状态：result 一律为 None。
+
+    def _get_active_window_tool(self) -> dict[str, Any]:
+        """读取前台窗口。未授权或读取失败时返回明确失败。"""
+        from .window_info import get_active_window
+
+        try:
+            raw = get_active_window()
+        except Exception as exc:
+            return {
+                "success": False,
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": "读取活动窗口失败。",
+            }
+
+        if not isinstance(raw, dict) or not raw.get("success"):
+            reason = ""
+            if isinstance(raw, dict):
+                reason = raw.get("error") or ""
+            return {
+                "success": False,
+                "result": None,
+                "error": reason or "无法读取活动窗口。",
+                "message": f"读取活动窗口失败：{reason or '未知原因'}",
+            }
+
+        window = raw.get("window") or {}
+
+        # 最小必要原则：只回传模型理解桌面所需的字段，
+        # 不暴露窗口句柄与进程完整路径。
+        summary = {
+            "title": window.get("title") or "",
+            "process_name": self._process_name(window.get("process_path")),
+            "x": window.get("x"),
+            "y": window.get("y"),
+            "width": window.get("width"),
+            "height": window.get("height"),
+            "visible": window.get("visible"),
+            "minimized": window.get("minimized"),
+        }
+
+        title = summary["title"] or "（无标题窗口）"
+
+        return {
+            "success": True,
+            "result": summary,
+            "error": None,
+            "message": f"当前活动窗口：{title}",
+        }
+
+    def _list_windows_tool(self, limit=None) -> dict[str, Any]:
+        """枚举可见窗口。参数非法或未授权时返回明确失败。"""
+        from .window_info import (
+            DEFAULT_WINDOW_LIMIT,
+            list_visible_windows,
+        )
+
+        if limit is None:
+            limit = DEFAULT_WINDOW_LIMIT
+
+        try:
+            windows = list_visible_windows(limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": f"参数无效：{exc}",
+            }
+        except PermissionError as exc:
+            return {
+                "success": False,
+                "result": None,
+                "error": str(exc),
+                "message": f"读取窗口列表失败：{exc}",
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": "读取窗口列表失败。",
+            }
+
+        return {
+            "success": True,
+            "result": list(windows),
+            "error": None,
+            "message": f"当前共有 {len(windows)} 个可见窗口。",
+        }
+
+    @staticmethod
+    def _process_name(process_path):
+        """从完整路径取进程文件名；不把完整路径交给模型。"""
+        if not isinstance(process_path, str) or not process_path:
+            return ""
+        try:
+            import os
+            return os.path.basename(process_path)
+        except Exception:
+            return ""
+
     def register(
         self,
         schema: ToolDef,

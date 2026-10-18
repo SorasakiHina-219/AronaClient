@@ -2089,10 +2089,13 @@ class AIClient:
         )
 
         # 使用临时消息列表发送请求，避免感知请求污染会话上下文。
-        # save_to_session=True 时使用 self.messages（含历史上下文）；
+        # save_to_session=True 时 self.messages 已包含本次 request_message，
+        # 因此这里直接复制一份，**不能**再拼一次 request_message ——
+        # 否则同一条用户消息会被重复发送给模型（浪费 token，且会让
+        # 模型误以为用户说了两遍）。
         # save_to_session=False 时使用仅含本次请求的临时列表。
         context_messages = (
-            self.messages + [request_message]
+            list(self.messages)
             if save_to_session
             else [request_message]
         )

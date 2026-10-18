@@ -172,8 +172,12 @@ class Downloader:
                         "message": dns_result["message"],
                     }
 
-                # 获取解析后的 IP 列表（取第一个）
-                resolved_ip = self._get_first_ip(hostname)
+                # 关键安全修复（TOCTOU）：
+                # 连接目标必须复用**校验时那一次**解析出的 IP，
+                # 不能再调用一次 getaddrinfo —— 否则两次解析之间
+                # 存在 DNS 重绑窗口，可能出现「校验的是公网 IP、
+                # 实际连的是私网 IP」的绕过。
+                resolved_ip = dns_result.get("ip")
                 if resolved_ip is None:
                     return {
                         "success": False,
@@ -181,23 +185,34 @@ class Downloader:
                         "path": None,
                         "size": None,
                         "sha256": None,
-                        "error": "DNS 解析无有效 IP 地址。",
-                        "message": "下载失败：DNS 解析结果为空。",
+                        "error": "DNS 校验结果缺少可用 IP 地址。",
+                        "message": "下载失败：DNS 解析结果不可用。",
                     }
 
-                # 从 URL 提取路径
+                # 从 URL 提取路径与端口（端口不能硬编码 443，
+                # 否则 https://host:8443/ 这类 URL 会连错目标）
                 from urllib.parse import urlparse
                 parsed = urlparse(current_url)
                 path = parsed.path or "/"
                 if parsed.query:
                     path += "?" + parsed.query
 
+                url_port = parsed.port or 443
+
+                # Host 头在非默认端口时必须带上端口号，否则服务端
+                # 会按默认端口理解，语义与原始 URL 不一致。
+                host_header = (
+                    hostname
+                    if url_port == 443
+                    else f"{hostname}:{url_port}"
+                )
+
                 # 创建连接到已验证 IP 的 pool
                 # assert_hostname: TLS 证书验证使用原始域名
                 # server_hostname: SNI 使用原始域名
                 pool = urllib3.HTTPSConnectionPool(
                     resolved_ip,
-                    port=443,
+                    port=url_port,
                     assert_hostname=hostname,
                     server_hostname=hostname,
                     timeout=self._timeout,
@@ -206,7 +221,7 @@ class Downloader:
                 try:
                     response = pool.request(
                         'GET', path,
-                        headers={'Host': hostname},
+                        headers={'Host': host_header},
                         preload_content=True,
                     )
 
@@ -595,29 +610,17 @@ class Downloader:
         parsed = urlparse(url)
         return parsed.hostname
 
-    def _get_first_ip(self, hostname):
-        """
-        获取 DNS 解析的第一个 IP 地址。
-        用于构建 urllib3 连接池。
-        """
-        try:
-            addr_info = socket.getaddrinfo(
-                hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
-        except socket.gaierror:
-            return None
-
-        if not addr_info:
-            return None
-
-        return addr_info[0][4][0]
-
     def _resolve_and_validate_dns(self, hostname):
         """
         解析 DNS 并校验所有返回的 IP 地址。
 
         返回：
-            {"success": bool, "error": str|None, "message": str}
+            {"success": bool, "ip": str|None, "error": str|None,
+             "message": str}
+
+        其中 ``ip`` 是**本次校验通过的第一个公网 IP**。
+        调用方必须直接用这个 IP 建立连接，不得再次解析 ——
+        否则两次解析之间的 DNS 重绑窗口会让连接绕过校验。
 
         安全策略：
             - DNS 解析失败 → fail-closed（拒绝）
@@ -647,6 +650,10 @@ class Downloader:
 
         has_public = False
         has_private = False
+        # 记录第一个通过校验的公网 IP，供本次连接直接使用。
+        # 这样「校验的 IP」与「连接的 IP」是同一个对象，
+        # 不依赖第二次 DNS 解析（消除 TOCTOU 重绑窗口）。
+        first_public_ip = None
 
         for info in addr_info:
             ip_str = info[4][0]
@@ -672,6 +679,8 @@ class Downloader:
                 has_private = True
             else:
                 has_public = True
+                if first_public_ip is None:
+                    first_public_ip = ip_str
 
         # 混合地址 → 拒绝（疑似 DNS 重绑）
         if has_public and has_private:
@@ -692,7 +701,7 @@ class Downloader:
             }
 
         # 全部为公网地址 → 放行
-        return {"success": True}
+        return {"success": True, "ip": first_public_ip}
 
     def _is_private_or_reserved_ip(self, hostname):
         """
@@ -732,18 +741,16 @@ class Downloader:
     def _resolve_redirect_url(self, base_url, location):
         """
         解析重定向 URL，处理相对路径。
+
+        必须用**完整 base_url**（含路径）做 RFC 3986 解析：
+        例如 base=https://a.com/x/y、location='f.txt'
+        正确结果是 https://a.com/x/f.txt，
+        而不是丢掉 /x/ 变成 https://a.com/f.txt
+        （后者会让重定向落到错误的资源上）。
         """
-        from urllib.parse import urljoin, urlparse
+        from urllib.parse import urljoin
 
-        base = urlparse(base_url)
-        loc = urlparse(location)
-
-        # 已经是绝对 URL
-        if loc.scheme:
-            return location
-
-        # 相对路径
-        return urljoin(base.scheme + "://" + base.netloc, location)
+        return urljoin(base_url, location)
 
     def _resolve_filename(self, filename, url, content):
         """确定保存文件名。"""
