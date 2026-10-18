@@ -210,12 +210,21 @@ class Downloader:
                 # 创建连接到已验证 IP 的 pool
                 # assert_hostname: TLS 证书验证使用原始域名
                 # server_hostname: SNI 使用原始域名
+                #
+                # retries=False 是**安全必需**的，不是性能选项：
+                # urllib3 默认 retries=Retry(3)，而 Retry 默认
+                # redirect=True —— 会自动跟随 301/302/303/307/308。
+                # 那样一来本模块下面的手动逐跳校验会被完全绕过：
+                # 服务器只要返回一个 302 指向私网/HTTP，urllib3 就会
+                # 自己跳过去，既不重新解析 DNS，也不校验目标。
+                # 关掉后 3xx 原样返回，由本模块逐跳校验。
                 pool = urllib3.HTTPSConnectionPool(
                     resolved_ip,
                     port=url_port,
                     assert_hostname=hostname,
                     server_hostname=hostname,
                     timeout=self._timeout,
+                    retries=False,
                 )
 
                 try:
@@ -223,6 +232,7 @@ class Downloader:
                         'GET', path,
                         headers={'Host': host_header},
                         preload_content=True,
+                        retries=False,
                     )
 
                     # 检查是否是重定向
@@ -592,8 +602,25 @@ class Downloader:
                 "message": "下载失败：循环重定向。",
             }
 
-        # 检查 IP 地址类型
-        if self._is_private_or_reserved_ip(parsed.hostname):
+        # 检查 IP 地址类型。
+        #
+        # 这里**只**对 IP 字面量做即时判断，不对域名做 DNS 解析：
+        #   * 域名目标的 DNS 校验由循环顶部的 _resolve_and_validate_dns()
+        #     统一执行，且那次解析出的 IP 就是实际连接目标；
+        #   * 若在这里再解析一次，就又多出一个「校验用 DNS」与
+        #     「连接用 DNS」不一致的 TOCTOU 窗口，而且纯属冗余。
+        try:
+            literal_ip = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            literal_ip = None
+
+        if literal_ip is not None and (
+            literal_ip.is_private
+            or literal_ip.is_loopback
+            or literal_ip.is_link_local
+            or literal_ip.is_reserved
+            or literal_ip.is_multicast
+        ):
             return {
                 "success": False,
                 "error": (
@@ -706,7 +733,20 @@ class Downloader:
     def _is_private_or_reserved_ip(self, hostname):
         """
         检查主机名是否解析为私有/回环/链路本地 IP。
-        用于重定向校验场景。
+
+        ⚠️ 已**不再**用于重定向校验，也**不得**用于任何连接决策。
+
+        为什么保留却不再调用：
+            本方法内部会做一次独立的 socket.getaddrinfo()。如果把它
+            放在「决定连哪里」的路径上，就会重新引入
+            「校验用 DNS」与「连接用 DNS」不一致的 TOCTOU 窗口
+            （DNS 重绑可借此绕过校验）。
+
+            连接目标只能来自 _resolve_and_validate_dns() 返回的
+            同一个 ip 字段，那里校验与连接复用同一次解析结果。
+
+        保留原因：避免删除既有接口造成潜在调用方中断；
+        仅作为独立的主机名分类工具存在。
         """
         try:
             addr_info = socket.getaddrinfo(
