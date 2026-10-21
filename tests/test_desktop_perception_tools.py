@@ -359,7 +359,7 @@ class TestAIToolCallLoop(unittest.TestCase):
         self.assertEqual(answer, "")
 
     def test_tool_result_truncated_to_4000(self):
-        """超长工具结果必须被截断且仍可理解。"""
+        """超长工具结果最终消息总长度必须 <= 4000（截断标记计入总长）。"""
         huge = "x" * 10000
 
         def fake_handler(**_kwargs):
@@ -401,7 +401,8 @@ class TestAIToolCallLoop(unittest.TestCase):
         tool_msgs = [m for m in messages if m.get("role") == "tool"]
         content = tool_msgs[0]["content"]
 
-        self.assertLessEqual(len(content), 4000 + len("...[truncated]"))
+        # 硬上限：最终总长 <= 4000（前缀 + 正文 + 截断标记均计入，不超 4000）
+        self.assertLessEqual(len(content), 4000)
         self.assertTrue(content.endswith("...[truncated]"))
 
     def test_malformed_json_arguments_tolerated(self):
