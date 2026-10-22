@@ -12,6 +12,17 @@ load_dotenv()
 
 DEFAULT_PROVIDER = "deepseek"
 
+# =========================
+# 图片生成（R12.3-07 M4：仅必要配置常量）
+# =========================
+
+# G8：结果输出目录（相对项目根；M3 在 UI 层解析为绝对路径）。
+IMAGE_RESULTS_DIR = "workspace/results"
+
+# 服务商白名单的唯一来源是
+# core.settings.SettingsManager.IMAGE_PROVIDER_WHITELIST（02 P5 统一注册，
+# 避免 config / settings / 适配器三处硬编码漂移）。
+
 DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
 
 DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-chat"

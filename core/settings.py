@@ -70,6 +70,22 @@ class SettingsManager:
                 "enabled": False,
                 "interval_seconds": 30,
             },
+            # 图片生成（R12.3-02 P3/F1：默认【关闭】，fail-closed）。
+            #
+            # 只有 enabled=True 且 服务商已注册 + 适配器受支持 +
+            # API Key 存在 + 连接安全条件全部满足时才允许网络调用。
+            # 任何前置条件失败 -> 零网络请求。
+            "image_generation": {
+                "enabled": False,
+                "provider": "openai",
+                "providers": {
+                    "openai": {
+                        "base_url": "https://api.openai.com/v1",
+                        "protocol": "openai-images",
+                        "model": "gpt-image-1",
+                    },
+                },
+            },
         }
 
     def _load_settings(self):
@@ -157,6 +173,47 @@ class SettingsManager:
                 _da_interval = _da.get("interval_seconds")
                 if isinstance(_da_interval, int) and 5 <= _da_interval <= 600:
                     defaults["desktop_awareness"]["interval_seconds"] = _da_interval
+
+            # 图片生成：加法迁移 + fail-closed 解析（R12.3-02 C2/C4，
+            # 不影响既有聊天提供商行为）。
+            #
+            # - enabled 只接受【真正的 bool True】；
+            # - providers 只接受 dict，且每个 provider 只保留白名单内
+            #   的键（base_url/protocol/model）与类型正确值；
+            # - API Key 永不在此文件中保存（G2：仅 keyring）。
+            _ig = loaded.get("image_generation")
+            if isinstance(_ig, dict):
+                _ig_enabled = _ig.get("enabled")
+                if _ig_enabled is True:
+                    defaults["image_generation"]["enabled"] = True
+                _ig_provider = _ig.get("provider")
+                if isinstance(_ig_provider, str) and _ig_provider.strip():
+                    defaults["image_generation"]["provider"] = (
+                        _ig_provider.strip().lower()
+                    )
+                _ig_providers = _ig.get("providers")
+                if isinstance(_ig_providers, dict):
+                    for pid, pconf in _ig_providers.items():
+                        if not isinstance(pid, str) or not isinstance(
+                            pconf, dict
+                        ):
+                            continue
+                        cleaned = {}
+                        _bu = pconf.get("base_url")
+                        if isinstance(_bu, str) and _bu.startswith(
+                            "https://"
+                        ):
+                            cleaned["base_url"] = _bu
+                        _pr = pconf.get("protocol")
+                        if isinstance(_pr, str) and _pr.strip():
+                            cleaned["protocol"] = _pr.strip().lower()
+                        _md = pconf.get("model")
+                        if isinstance(_md, str) and _md.strip():
+                            cleaned["model"] = _md.strip()
+                        if cleaned:
+                            defaults["image_generation"]["providers"][
+                                pid.strip().lower()
+                            ] = cleaned
 
             return defaults
 
@@ -515,3 +572,162 @@ class SettingsManager:
         )
 
         return self.settings
+
+    # ============================================================
+    # 图片生成（R12.3-02 M2：统一服务商注册与白名单常量）
+    # ============================================================
+    #
+    # 第一阶段只注册经过审查的 OpenAI 图片生成连接目标
+    # （03 R2 / 04 方案 B）。其他服务商 / 未知域名 / 未知协议
+    # 一律 CONNECT_TARGET_UNBOUND / UNSUPPORTED_PROTOCOL（05 C1）。
+    #
+    # API Key 不在此文件中保存（02 C4 / 03 R3，B1 决议）：
+    # 唯一合法路径是 keyring（Windows 凭据管理器），键名
+    # api_key_image_<provider>，由 SettingsManager.get_api_key
+    # （keyring 路径，L281-340 区段）读写。
+
+    IMAGE_PROVIDER_WHITELIST = {
+        "openai": {
+            "base_url": "https://api.openai.com/v1",
+            "protocol": "openai-images",
+            "model": "gpt-image-1",
+        },
+    }
+
+    def get_image_generation_section(self):
+        """fail-closed 读取 image_generation 配置块（加法迁移，C2）。
+
+        缺失 / 损坏 / 类型错误时返回【干净的默认】（enabled=False），
+        永不返回半初始化结构。
+        """
+        section = self.settings.get("image_generation")
+        if not isinstance(section, dict):
+            return self._default_settings()["image_generation"]
+
+        out = {
+            "enabled": section.get("enabled") is True,
+            "provider": "openai",
+            "providers": {},
+        }
+        prov = section.get("provider")
+        if isinstance(prov, str) and prov.strip():
+            out["provider"] = prov.strip().lower()
+        providers = section.get("providers")
+        if isinstance(providers, dict):
+            for pid, pconf in providers.items():
+                if not isinstance(pid, str) or not isinstance(pconf, dict):
+                    continue
+                cleaned = {}
+                bu = pconf.get("base_url")
+                if isinstance(bu, str) and bu.startswith("https://"):
+                    cleaned["base_url"] = bu
+                pr = pconf.get("protocol")
+                if isinstance(pr, str) and pr.strip():
+                    cleaned["protocol"] = pr.strip().lower()
+                md = pconf.get("model")
+                if isinstance(md, str) and md.strip():
+                    cleaned["model"] = md.strip()
+                if cleaned:
+                    out["providers"][pid.strip().lower()] = cleaned
+        return out
+
+    def get_image_provider(self, provider_id):
+        """统一服务商注册入口（02 P5）。
+
+        白名单内 provider 合并注册值与白名单默认；未知 provider
+        返回 None（适配器层据此抛 PROVIDER_NOT_REGISTERED /
+        CONNECT_TARGET_UNBOUND，05 C1）。
+        """
+        provider_id = str(provider_id).strip().lower()
+        whitelist = self.IMAGE_PROVIDER_WHITELIST.get(provider_id)
+        if whitelist is None:
+            return None
+
+        section = self.get_image_generation_section()
+        override = section["providers"].get(provider_id, {})
+
+        merged = {
+            "base_url": override.get(
+                "base_url", whitelist["base_url"]
+            ),
+            "protocol": override.get(
+                "protocol", whitelist["protocol"]
+            ),
+            "model": override.get(
+                "model", whitelist["model"]
+            ),
+        }
+        return merged
+
+    def set_image_generation_enabled(self, enabled):
+        """开关。fail-closed 落盘：只接受真正的 bool（C2/C4）。"""
+        section = self.settings.setdefault(
+            "image_generation",
+            {},
+        )
+        section["enabled"] = enabled is True
+        self._save_settings()
+
+    def set_image_provider_config(self, provider_id, config):
+        """更新白名单内 provider 的注册值（base_url/protocol/model）。
+
+        未知 provider 拒绝（G3）；非法 URL（非 https）拒绝。
+        不落盘任何密钥（G2）。
+        """
+        provider_id = str(provider_id).strip().lower()
+        if provider_id not in self.IMAGE_PROVIDER_WHITELIST:
+            raise ValueError(
+                f"不支持的图片服务商：{provider_id}"
+            )
+        if not isinstance(config, dict):
+            raise ValueError("config 必须是 dict")
+
+        section = self.settings.setdefault(
+            "image_generation",
+            {},
+        )
+        providers = section.setdefault("providers", {})
+        entry = providers.setdefault(provider_id, {})
+        for key in ("base_url", "protocol", "model"):
+            if key in config:
+                value = config[key]
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"{key} 必须是非空字符串"
+                    )
+                if key == "base_url" and not value.startswith(
+                    "https://"
+                ):
+                    raise ValueError(
+                        "base_url 必须以 https:// 开头（G3/G4）"
+                    )
+                entry[key] = value.strip()
+        self._save_settings()
+
+    def get_image_api_key(self):
+        """图片生成密钥：只从 keyring 读取（G2）。
+
+        键名 api_key_image_<provider>，服务 AronaClient。
+        缺失 / 读取失败 -> 空字符串（调用方判 CREDENTIAL_MISSING）。
+        永不写入 settings.json。
+        """
+        provider_id = (
+            self.get_image_generation_section().get(
+                "provider",
+                "openai",
+            )
+        )
+        return self.get_api_key(f"image_{provider_id}")
+
+    def set_image_api_key(self, api_key):
+        """图片生成密钥：只写入 keyring（G2）。
+
+        空值 = 删除（与 set_api_key 的语义一致）。
+        """
+        provider_id = (
+            self.get_image_generation_section().get(
+                "provider",
+                "openai",
+            )
+        )
+        self.set_api_key(f"image_{provider_id}", api_key)

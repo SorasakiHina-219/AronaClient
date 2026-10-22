@@ -97,6 +97,27 @@ except Exception as _awareness_error:
         _awareness_error,
     )
 
+# R12.3-07 M3：图片生成（默认关闭，fail-closed 导入）。
+#
+# 与桌面感知同款保护：模块本身或依赖出问题，
+# 只让「图片生成」按钮不可用，不影响聊天/语音/桌面功能。
+try:
+
+    from core.image_generation import (
+        ImageGenerationService,
+        ImageGenError,
+    )
+
+except Exception as _image_gen_error:
+
+    ImageGenerationService = None
+    ImageGenError = None
+
+    print(
+        "图片生成模块加载失败，该功能将不可用：",
+        _image_gen_error,
+    )
+
 
 # V0.1 桌面小人物。
 #
@@ -143,6 +164,26 @@ WORKSPACE_DIR = APP_DIR / "workspace"
 UPLOADS_DIR = WORKSPACE_DIR / "uploads"
 RESULTS_DIR = WORKSPACE_DIR / "results"
 TEMP_DIR = WORKSPACE_DIR / "temp"
+
+# R12.3-07 M3：图片生成门禁错误码 -> 用户安全文案（G7 固定分类）。
+_IMAGE_GEN_ERR_MESSAGES = {
+    "FEATURE_DISABLED": "图片生成未开启，请在设置中启用。",
+    "PROVIDER_NOT_REGISTERED": "该图片服务商未配置。",
+    "UNSUPPORTED_PROTOCOL": "该协议尚未实现（第一阶段仅 OpenAI）。",
+    "CREDENTIAL_MISSING": "缺少 API Key，请打开设置填写。",
+    "CONNECT_TARGET_UNBOUND": "无法验证连接目标，已拒绝。",
+    "DNS_RESOLUTION_FAILED": "域名解析失败。",
+    "CONNECT_PEER_REJECTED": "连接目标校验失败，已拒绝。",
+    "TLS_VERIFICATION_FAILED": "TLS 证书验证失败，已拒绝。",
+    "REDIRECT_REJECTED": "检测到重定向，已拒绝。",
+    "REQUEST_TIMEOUT": "请求超时。",
+    "RATE_LIMITED": "服务商限流，请稍后再试。",
+    "PROVIDER_ERROR": "服务商异常。",
+    "INVALID_IMAGE_RESPONSE": "生成结果无效。",
+    "IMAGE_DECODE_FAILED": "图片解码失败，已丢弃。",
+    "OUTPUT_TOO_LARGE": "结果超出大小上限。",
+    "INTERNAL_ERROR": "内部错误。",
+}
 
 APPEARANCE_FILE = APPEARANCE_DIR / "appearance.json"
 
@@ -713,6 +754,55 @@ class AwarenessReplyWorker(QObject):
             self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ============================================================
+# 图片生成后台任务（R12.3-07 M3 / G9）
+# ============================================================
+
+class ImageGenWorker(QObject):
+    """
+    在后台线程里执行一次图片生成。
+
+    与 AwarenessReplyWorker 使用同一套 QThread + moveToThread 写法，
+    避免网络请求期间卡住界面。所有安全门禁与连接绑定逻辑在
+    core.image_generation 内（M1），这里只负责线程化与结果回传。
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        service,
+        prompt,
+        size="1024x1024",
+        quality="low",
+        model="",
+    ):
+        super().__init__()
+        self.service = service
+        self.prompt = prompt
+        self.size = size
+        self.quality = quality
+        self.model = model
+
+    @Slot()
+    def run(self):
+        try:
+            path = self.service.generate(
+                prompt=self.prompt,
+                size=self.size,
+                quality=self.quality,
+                model=self.model,
+            )
+            self.finished.emit(path)
+        except Exception as exc:
+            # G7：只回传固定分类的用户安全消息，不回传 SDK 原文。
+            msg = getattr(exc, "user_message", None)
+            if not msg:
+                msg = str(exc)
+            self.error.emit(msg)
 
 
 # ============================================================
@@ -3997,6 +4087,11 @@ class AronaUI(QMainWindow):
         self._awareness_reply_busy = False  # 防止重复提交 AI 回复请求
         self.awareness_reply_threads = []  # 追踪感知回复线程
 
+        # ── R12.3-07 M3：图片生成 ──
+        self.image_gen_threads = []      # 追踪图片生成线程 (thread, worker)
+        self._image_gen_busy = False     # 防止重复提交
+        self._image_gen_service = None   # 惰性构造（门禁不满足时不建网络）
+
         self.speech_thread = None
         self.speech_worker = None
 
@@ -4524,12 +4619,31 @@ class AronaUI(QMainWindow):
             self.open_settings
         )
 
+        # R12.3-07 M3：图片生成入口（默认关闭；门禁不满足时拒绝，零网络）。
+        image_gen_button = QToolButton()
+
+        image_gen_button.setText(
+            "🖼"
+        )
+
+        image_gen_button.setToolTip(
+            "生成图片（需在设置中开启并配置 API Key）"
+        )
+
+        image_gen_button.clicked.connect(
+            self.start_image_generation
+        )
+
         top_layout.addWidget(
             self.model_toggle
         )
 
         top_layout.addWidget(
             fullscreen_button
+        )
+
+        top_layout.addWidget(
+            image_gen_button
         )
 
         top_layout.addWidget(
@@ -7094,6 +7208,137 @@ class AronaUI(QMainWindow):
                 path,
                 "image",
             )
+
+    # ========================================================
+    # R12.3-07 M3：图片生成入口（后台线程，G9）
+    # ========================================================
+
+    def _image_gen_service(self):
+        """惰性构造图片生成服务（门禁不满足时返回 None，零网络）。"""
+        if ImageGenerationService is None:
+            return None
+        if self._image_gen_service is None:
+            try:
+                self._image_gen_service = ImageGenerationService(
+                    settings=self.ai_client.settings,
+                    results_dir=RESULTS_DIR,
+                )
+            except Exception:
+                return None
+        return self._image_gen_service
+
+    def start_image_generation(self):
+        """从聊天输入框读取提示词，提交后台生成任务。"""
+        if self._image_gen_busy:
+            return
+
+        prompt = self.input.toPlainText().strip()
+        if not prompt:
+            QMessageBox.information(
+                self,
+                "请输入描述",
+                "请在下方输入你想生成的图片描述。",
+            )
+            return
+
+        service = self._image_gen_service()
+        if service is None:
+            self._show_image_gen_error("图片生成模块不可用。")
+            return
+
+        ok, err_code = service.is_available()
+        if not ok:
+            if err_code == "CREDENTIAL_MISSING":
+                QMessageBox.information(
+                    self,
+                    "缺少 API Key",
+                    "请先在设置中填入 OpenAI 图片 API Key，并开启图片生成。",
+                )
+            else:
+                msg = _IMAGE_GEN_ERR_MESSAGES.get(
+                    err_code, "图片生成当前不可用。"
+                )
+                self._show_image_gen_error(msg)
+            return
+
+        # 占用输入框：清空并把提示作为展示消息。
+        self.input.clear()
+        self.add_message("user", f"🖼 {prompt}")
+        self.stage_status.setText("正在生成图片……")
+        self._image_gen_busy = True
+
+        thread = QThread(self)
+        worker = ImageGenWorker(service, prompt)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_image_gen_finished)
+        worker.error.connect(self._on_image_gen_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        pair = (thread, worker)
+        self.image_gen_threads.append(pair)
+        thread.finished.connect(
+            lambda p=pair: self._remove_image_gen_thread(p)
+        )
+        thread.start()
+
+    def _on_image_gen_finished(self, path):
+        self._image_gen_busy = False
+        try:
+            self.add_message("assistant", f"✅ 图片已生成：{path.name}")
+            self._show_image_in_bubble(str(path))
+        except Exception:
+            self.add_message("assistant", f"✅ 图片已生成：{path}")
+        self.stage_status.setText("图片生成完成～")
+
+    def _on_image_gen_error(self, error_text):
+        self._image_gen_busy = False
+        self._show_image_gen_error(error_text)
+
+    def _show_image_gen_error(self, text):
+        self.add_message("assistant", f"⚠️ {text}")
+        self.stage_status.setText("图片生成失败。")
+
+    def _show_image_in_bubble(self, path):
+        """把生成图作为附件加进聊天区（复用现有附件渲染）。"""
+        try:
+            if Path(path).exists():
+                self.add_attachment(path, "image")
+        except Exception:
+            pass
+
+    def _remove_image_gen_thread(self, pair):
+        if pair in self.image_gen_threads:
+            self.image_gen_threads.remove(pair)
+
+    def _stop_image_gen_threads(self):
+        """窗口关闭时收尾图片生成线程（G9：不阻塞 UI 退出）。
+
+        有界等待 1.5s；若线程仍未停止（网络阻塞中），
+        从追踪列表移除以保留线程引用，避免 deleteLater 销毁
+        仍被 worker 引用中的 QThread（防止 worker 发信号到已析构线程）。
+        与 _stop_background_threads 的 orphan 策略一致。
+        """
+        for pair in list(getattr(self, "image_gen_threads", [])):
+            thread, worker = pair[0], pair[1]
+            try:
+                thread.quit()
+            except Exception:
+                pass
+            try:
+                if not thread.wait(1500):
+                    # 线程仍在运行（网络请求阻塞中）：保留引用，
+                    # 不 deleteLater，避免 use-after-free。
+                    self.image_gen_threads.remove(pair)
+                    logger.warning(
+                        "图片生成线程未在 1.5s 内停止，已保留引用避免销毁。"
+                    )
+            except Exception:
+                pass
 
     def add_video(
         self,
@@ -9842,6 +10087,12 @@ class AronaUI(QMainWindow):
 
         # V0.3 先停止桌面自主感知
         self._stop_desktop_awareness()
+
+        # R12.3-07 M3：收尾图片生成后台线程（G9）
+        try:
+            self._stop_image_gen_threads()
+        except Exception:
+            pass
 
         try:
 
