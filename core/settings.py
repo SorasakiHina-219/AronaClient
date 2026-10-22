@@ -86,6 +86,26 @@ class SettingsManager:
                     },
                 },
             },
+            # R13-MEDIA-01：多媒体服务商通用配置（图片/视频/语音独立）。
+            # 完全开放：用户可自行添加服务商；密钥只进 keyring。
+            # 默认全部关闭（fail-closed，与 image_generation 一致）。
+            "media_services": {
+                "image": {
+                    "enabled": False,
+                    "provider": "",
+                    "providers": {},
+                },
+                "video": {
+                    "enabled": False,
+                    "provider": "",
+                    "providers": {},
+                },
+                "voice": {
+                    "enabled": False,
+                    "provider": "",
+                    "providers": {},
+                },
+            },
         }
 
     def _load_settings(self):
@@ -98,6 +118,16 @@ class SettingsManager:
                 defaults
             )
             return defaults
+
+        # media_services：始终保留默认结构（fail-closed，加载坏值时回退）。
+        # 这样 _save_settings(self.settings) 时 media_services 一定存在，
+        # 用户添加的 provider 才不会在重载时被丢弃（R13-MEDIA-01）。
+        if "media_services" not in defaults:
+            defaults["media_services"] = (
+                self._default_media_services()[
+                    "media_services"
+                ]
+            )
 
         try:
             with open(
@@ -215,9 +245,40 @@ class SettingsManager:
                                 pid.strip().lower()
                             ] = cleaned
 
+            # R13-MEDIA-01：media_services fail-closed 解析（加法迁移，
+            # 不影响既有 image_generation / 聊天提供商行为）。
+            _ms = loaded.get("media_services")
+            if isinstance(_ms, dict):
+                for service in self.MEDIA_SERVICES:
+                    sec = _ms.get(service)
+                    if not isinstance(sec, dict):
+                        continue
+                    tgt = defaults["media_services"][service]
+                    if sec.get("enabled") is True:
+                        tgt["enabled"] = True
+                    prov = sec.get("provider")
+                    if isinstance(prov, str) and prov.strip():
+                        tgt["provider"] = prov.strip().lower()
+                    provs = sec.get("providers")
+                    if isinstance(provs, dict):
+                        for pid, pconf in provs.items():
+                            if not isinstance(pid, str):
+                                continue
+                            cleaned = self._clean_provider_entry(pconf)
+                            if cleaned:
+                                tgt["providers"][
+                                    pid.strip().lower()
+                                ] = cleaned
+
             return defaults
 
         except Exception:
+            # R13-MEDIA-01：加载失败时，确保 media_services 默认结构存在，
+            # 避免调用方拿到 None/缺失的 media_services 块。
+            if "media_services" not in defaults:
+                defaults["media_services"] = self._default_media_services()[
+                    "media_services"
+                ]
             return defaults
 
     def _save_settings(
@@ -731,3 +792,268 @@ class SettingsManager:
             )
         )
         self.set_api_key(f"image_{provider_id}", api_key)
+
+    # ============================================================
+    # R13-MEDIA-01：多媒体服务商通用配置（图片/视频/语音相互独立）
+    # ============================================================
+    #
+    # 设计：
+    # - settings.json 的 media_services.{service}.providers 完全开放：
+    #   用户可以自行添加服务商名称、API 地址（https://）、模型名与
+    #   适配器可选参数（extra_params）；
+    # - 图片/视频/语音的 provider 配置【相互独立】（media_services
+    #   按 service 分节），避免一种服务的配置误用于另一种服务；
+    # - 密钥【只】存 keyring，键名 media_key_<service>_<provider>
+    #   （图片沿用既有 image_<provider> 键名，保持旧配置兼容）；
+    #   settings.json 永不保存密钥明文；
+    # - 加载/解析 fail-closed：坏值回退干净默认，不把半初始化结构
+    #   暴露给调用方。
+
+    MEDIA_SERVICES = ("image", "video", "voice")
+
+    # keyring 键名前缀映射：service -> 前缀（图片兼容旧键名）
+    MEDIA_KEY_PREFIX = {
+        "image": "image_",
+        "video": "media_key_video_",
+        "voice": "media_key_voice_",
+    }
+
+    def _default_media_services(self):
+        return {
+            "media_services": {
+                service: {
+                    "enabled": False,
+                    "provider": "",
+                    "providers": {},
+                }
+                for service in self.MEDIA_SERVICES
+            },
+        }
+
+    def _clean_provider_entry(self, pconf):
+        """清洗单个 provider 配置（fail-closed，返回空 dict 表示无效）。"""
+        if not isinstance(pconf, dict):
+            return {}
+        out = {}
+        name = pconf.get("name")
+        if isinstance(name, str) and name.strip():
+            out["name"] = name.strip()[:64]
+        bu = pconf.get("base_url")
+        if isinstance(bu, str) and bu.strip().startswith("https://"):
+            out["base_url"] = bu.strip()
+        md = pconf.get("model")
+        if isinstance(md, str) and md.strip():
+            out["model"] = md.strip()[:128]
+        pr = pconf.get("protocol")
+        if isinstance(pr, str) and pr.strip():
+            out["protocol"] = pr.strip().lower()
+        extra = pconf.get("extra_params")
+        if isinstance(extra, dict):
+            clean_extra = {}
+            for k, v in extra.items():
+                if isinstance(k, str) and isinstance(v, (str, int, float, bool)):
+                    clean_extra[k.strip()[:64]] = v
+            if clean_extra:
+                out["extra_params"] = clean_extra
+        return out
+
+    def _load_media_services(self):
+        """fail-closed 读取 media_services 配置块。"""
+        defaults = self._default_media_services()["media_services"]
+        loaded = self.settings.get("media_services")
+        if not isinstance(loaded, dict):
+            return defaults
+        for service in self.MEDIA_SERVICES:
+            section = loaded.get(service)
+            target = defaults[service]
+            if not isinstance(section, dict):
+                continue
+            if section.get("enabled") is True:
+                target["enabled"] = True
+            prov = section.get("provider")
+            if isinstance(prov, str) and prov.strip():
+                target["provider"] = prov.strip().lower()
+            providers = section.get("providers")
+            if isinstance(providers, dict):
+                for pid, pconf in providers.items():
+                    if not isinstance(pid, str):
+                        continue
+                    cleaned = self._clean_provider_entry(pconf)
+                    if cleaned:
+                        target["providers"][pid.strip().lower()] = cleaned
+        return defaults
+
+    def get_media_services(self):
+        """fail-closed 读取 media_services 全部配置。"""
+        return self._load_media_services()
+
+    def get_media_service_section(self, service):
+        """读取单个 service 的配置（未知 service -> 干净默认）。"""
+        services = self._load_media_services()
+        if service not in services:
+            return {"enabled": False, "provider": "", "providers": {}}
+        return services[service]
+
+    def get_media_provider_config(self, service, provider_id):
+        """读取指定 service 下某 provider 的配置（未知 -> None）。"""
+        section = self.get_media_service_section(service)
+        providers = section.get("providers", {})
+        pid = str(provider_id).strip().lower()
+        entry = providers.get(pid)
+        if entry is None:
+            return None
+        out = dict(entry)
+        out.setdefault("base_url", "https://")
+        out.setdefault("model", "")
+        out.setdefault("protocol", "")
+        out.setdefault("name", pid)
+        out.setdefault("extra_params", {})
+        return out
+
+    def set_media_service_enabled(self, service, enabled):
+        self._save_media_service_patch(
+            service, {"enabled": enabled is True}
+        )
+
+    def set_media_service_provider(self, service, provider_id):
+        provider_id = str(provider_id).strip().lower()
+        self._save_media_service_patch(
+            service, {"provider": provider_id}
+        )
+
+    def add_media_provider(self, service, provider_id, config):
+        """添加/更新 service 下的一个 provider 配置（不落密钥）。
+
+        provider_id: 唯一标识（小写）；config: dict，可含
+        name/base_url/model/protocol/extra_params。
+        未知 service 拒绝。
+        """
+        service = str(service).strip().lower()
+        if service not in self.MEDIA_SERVICES:
+            raise ValueError(f"未知的多媒体服务：{service}")
+        provider_id = str(provider_id).strip().lower()
+        if not provider_id:
+            raise ValueError("provider id 不能为空")
+        cleaned = self._clean_provider_entry(config)
+        if "base_url" not in cleaned:
+            raise ValueError("缺少合法的 base_url（https:// 开头）")
+        cleaned.setdefault("name", provider_id)
+
+        section = self.settings.setdefault(
+            "media_services", {}
+        ).setdefault(
+            service,
+            {"enabled": False, "provider": "", "providers": {}},
+        )
+        providers = section.setdefault("providers", {})
+        providers[provider_id] = cleaned
+        # 若该 service 尚未选择 provider，自动指向新增的
+        if not section.get("provider"):
+            section["provider"] = provider_id
+        self._save_settings()
+
+    def remove_media_provider(self, service, provider_id):
+        """删除 service 下的一个 provider 配置 + 对应 keyring 密钥。
+
+        不触碰其他 provider 或其他 service 的密钥（隔离）。
+        """
+        service = str(service).strip().lower()
+        provider_id = str(provider_id).strip().lower()
+        section = self.settings.setdefault(
+            "media_services", {}
+        ).get(service)
+        if section and "providers" in section and provider_id in section["providers"]:
+            del section["providers"][provider_id]
+            # 若删的是当前选中的 provider，回退到剩余第一个
+            if section.get("provider") == provider_id:
+                remaining = list(section["providers"].keys())
+                section["provider"] = remaining[0] if remaining else ""
+            self._save_settings()
+        # 密钥隔离删除：只删该 service+provider 的键
+        self.delete_media_api_key(service, provider_id)
+
+    def _save_media_service_patch(self, service, patch):
+        service = str(service).strip().lower()
+        if service not in self.MEDIA_SERVICES:
+            raise ValueError(f"未知的多媒体服务：{service}")
+        section = self.settings.setdefault(
+            "media_services", {}
+        ).setdefault(
+            service,
+            {"enabled": False, "provider": "", "providers": {}},
+        )
+        for k, v in patch.items():
+            section[k] = v
+        self._save_settings()
+
+    def _media_keyring_key(self, service, provider_id):
+        prefix = self.MEDIA_KEY_PREFIX.get(service, f"media_key_{service}_")
+        return f"{prefix}{str(provider_id).strip().lower()}"
+
+    def get_media_api_key(self, service, provider_id=None):
+        """读某 service/provider 的密钥（keyring；缺失 -> 空串）。
+
+        provider_id=None 时读该 service 当前选中 provider。
+        永不写入 settings.json（G2 兼容：图片沿用 image_* 旧键名）。
+        """
+        service = str(service).strip().lower()
+        if provider_id is None:
+            provider_id = self.get_media_service_section(service).get(
+                "provider", ""
+            )
+        if not provider_id:
+            return ""
+        key_name = self._media_keyring_key(service, provider_id)
+        return self.get_api_key_by_key_name(key_name)
+
+    def set_media_api_key(self, service, provider_id, api_key):
+        """写某 service/provider 的密钥到 keyring（空值 = 删除）。"""
+        service = str(service).strip().lower()
+        if provider_id is None:
+            provider_id = self.get_media_service_section(service).get(
+                "provider", ""
+            )
+        if not provider_id:
+            raise ValueError("未指定 provider")
+        key_name = self._media_keyring_key(service, provider_id)
+        self.set_api_key_by_key_name(key_name, api_key)
+
+    def delete_media_api_key(self, service, provider_id):
+        if not provider_id:
+            return
+        key_name = self._media_keyring_key(service, provider_id)
+        try:
+            keyring.delete_password(
+                self.KEYRING_SERVICE, key_name
+            )
+        except Exception:
+            pass
+
+    def get_api_key_by_key_name(self, key_name):
+        """按显式键名读 keyring（密钥隔离的基础路径）。"""
+        try:
+            value = keyring.get_password(
+                self.KEYRING_SERVICE, key_name
+            )
+            return value or ""
+        except Exception:
+            return ""
+
+    def set_api_key_by_key_name(self, key_name, api_key):
+        """按显式键名写 keyring（空值 = 删除）。"""
+        api_key = str(api_key).strip()
+        if not api_key:
+            try:
+                keyring.delete_password(
+                    self.KEYRING_SERVICE, key_name
+                )
+            except Exception:
+                pass
+            return
+        keyring.set_password(
+            self.KEYRING_SERVICE, key_name, api_key
+        )
+
+    def has_media_api_key(self, service, provider_id=None):
+        """该 service/provider 是否已配置密钥（不落日志）。"""
+        return bool(self.get_media_api_key(service, provider_id))
