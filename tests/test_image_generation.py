@@ -648,5 +648,45 @@ class TestOpenAIBaseURLHandling(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# R12.3-10 F3：ui.py 属性遮蔽方法回归测试
+# ---------------------------------------------------------------------------
+
+class TestUIAttributeShadowing(unittest.TestCase):
+    """R12.3-10 F3：ui.py 中方法 `_image_gen_service` 不得被同名实例
+    属性遮蔽。若 `__init__` 设置 `self._image_gen_service = None`，
+    后续 `self._image_gen_service()` 调用会因 None 不可调用而抛
+    TypeError，导致图片生成功能永久不可用。
+
+    修复：实例属性重命名为 `_image_gen_service_obj`。
+    本测试通过 inspect 验证源文件中不存在遮蔽性赋值。
+    """
+
+    def test_no_shadowing_assignment_in_init(self):
+        import inspect
+        import ui
+        src = inspect.getsource(ui.AronaUI.__init__)
+        self.assertNotIn(
+            "self._image_gen_service =", src,
+            "ui.py __init__ must not assign to self._image_gen_service "
+            "(shadows the method, see R12.3-10 F3)",
+        )
+        self.assertIn(
+            "self._image_gen_service_obj =", src,
+            "ui.py __init__ must use self._image_gen_service_obj "
+            "(non-shadowing name, see R12.3-10 F3)",
+        )
+
+    def test_service_method_uses_obj_slot(self):
+        import inspect
+        import ui
+        src = inspect.getsource(ui.AronaUI._image_gen_service)
+        self.assertIn(
+            "self._image_gen_service_obj", src,
+            "_image_gen_service must read/write _image_gen_service_obj "
+            "(not the shadowing _image_gen_service attribute)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

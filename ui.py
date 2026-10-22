@@ -4090,7 +4090,7 @@ class AronaUI(QMainWindow):
         # ── R12.3-07 M3：图片生成 ──
         self.image_gen_threads = []      # 追踪图片生成线程 (thread, worker)
         self._image_gen_busy = False     # 防止重复提交
-        self._image_gen_service = None   # 惰性构造（门禁不满足时不建网络）
+        self._image_gen_service_obj = None  # 惰性构造（门禁不满足时不建网络）
 
         self.speech_thread = None
         self.speech_worker = None
@@ -7214,18 +7214,23 @@ class AronaUI(QMainWindow):
     # ========================================================
 
     def _image_gen_service(self):
-        """惰性构造图片生成服务（门禁不满足时返回 None，零网络）。"""
+        """惰性构造图片生成服务（门禁不满足时返回 None，零网络）。
+
+        注意：方法名与实例属性 `_image_gen_service` 同名，
+        Python 实例属性优先于方法查找。构造成功后将服务存入
+        私有槽 `_image_gen_service_obj`，避免属性遮蔽方法。
+        """
         if ImageGenerationService is None:
             return None
-        if self._image_gen_service is None:
+        if self._image_gen_service_obj is None:
             try:
-                self._image_gen_service = ImageGenerationService(
+                self._image_gen_service_obj = ImageGenerationService(
                     settings=self.ai_client.settings,
                     results_dir=RESULTS_DIR,
                 )
             except Exception:
                 return None
-        return self._image_gen_service
+        return self._image_gen_service_obj
 
     def start_image_generation(self):
         """从聊天输入框读取提示词，提交后台生成任务。"""
