@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -3479,21 +3480,27 @@ class SettingsDialog(QDialog):
         hint.setWordWrap(True)
         media_layout.addWidget(hint)
 
-        self._media_sections = {}
+        # 初始化容器（只建一次，避免被 _build_media_service_row 反复重置）
+        self._media_param_widgets = {}
+        self._media_sections_box = {}
+
         service_titles = {
             "image": "图片生成",
             "video": "视频生成",
             "voice": "语音（合成 / 识别）",
         }
         for service in ("image", "video", "voice"):
-            self._media_sections[service] = self._build_media_service_row(
+            self._media_param_widgets[service] = self._build_media_service_row(
                 media_layout, service, service_titles[service]
             )
 
         content_layout.addWidget(media_card)
 
     def _build_media_service_row(self, parent_layout, service, display):
-        """单个 service 的配置行（启用 + 服务商选择 + 参数编辑 + 增删）。"""
+        """单个 service 的配置行（启用 + 服务商选择 + 参数编辑 + 增删）。
+
+        返回 widgets dict；由调用方负责存入 _media_param_widgets[service]。
+        """
         section_box = QFrame()
         section_box.setStyleSheet(
             "QFrame { background: #0A0A0A; border: 1px solid #252525; "
@@ -3512,7 +3519,6 @@ class SettingsDialog(QDialog):
         head.addStretch()
 
         enabled_box = QCheckBox("启用")
-        self._media_sections_box = {}
         self._media_sections_box[(service, "enabled")] = enabled_box
         head.addWidget(enabled_box)
         vbox.addLayout(head)
@@ -3539,7 +3545,6 @@ class SettingsDialog(QDialog):
         vbox.addLayout(provider_row)
 
         # 参数编辑
-        self._media_param_widgets = {}
         form = QFormLayout()
         form.setSpacing(6)
 
@@ -3580,7 +3585,6 @@ class SettingsDialog(QDialog):
             "api_key": api_key_edit,
             "key_status": key_status,
         }
-        self._media_param_widgets.setdefault(service, widgets)
 
         # 数据加载（延迟到 load_current / refresh）
         provider_combo.currentIndexChanged.connect(
