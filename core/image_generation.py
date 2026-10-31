@@ -283,13 +283,29 @@ class PeerPolicyBackend(SyncBackend):
       4. 否则放行流供 TLS 继续。
 
     06 O3-3/O3-4 已实证该接缝（回环 TLS 服务器 + 真实池 + 真实 socket）。
+
+    S4-B2（P2 最小扩展，向后兼容）：可选 `on_peer` 回调 + 可选
+    `policy_state` 冻结授权集合。
+      - on_peer: callable(host, port, peer) -> bool，None 时沿用
+        `verified` 构造期集合（旧路径行为逐字节不变）。
+      - policy_state: 由调用方（media 结果下载路径）在构造 backend 时
+        注入的**逐请求冻结授权集**（frozenset[str]）；非 None 时
+        peer 判定 = `policy_state` ∩（on_peer 判定，若有）。
+        backend 本身不持有请求状态机，状态生命周期由调用方负责
+        （T1 专属池：与下载请求同生共灭，`close_media_client` 释放）。
+    单参数构造 `PeerPolicyBackend(verified_ips)` 契约保持不变
+    （tests/test_image_generation.py L438 负参断言依赖）。
     """
 
-    def __init__(self, verified_ips: set):
+    def __init__(self, verified_ips: set, on_peer=None, policy_state=None):
         super().__init__()
         if not isinstance(verified_ips, set):
             raise TypeError("verified_ips must be a set of str IPs")
         self.verified = set(verified_ips)
+        self.on_peer = on_peer
+        if policy_state is not None and not isinstance(policy_state, frozenset):
+            raise TypeError("policy_state must be a frozenset of str IPs")
+        self.policy_state = policy_state
         self.connect_log: list = []
 
     def connect_tcp(
@@ -317,13 +333,24 @@ class PeerPolicyBackend(SyncBackend):
                     peer = None
                 break
         self.connect_log.append((host, peer))
-        if peer is None or peer not in self.verified:
+        # S4-B2：判定优先级 policy_state（逐请求冻结集）> on_peer > verified。
+        # 三源均不满足时拒绝；任一源启用即 fail-closed。
+        allowed = True
+        if peer is None:
+            allowed = False
+        elif self.policy_state is not None:
+            allowed = peer in self.policy_state
+        elif self.on_peer is not None:
+            allowed = bool(self.on_peer(host, port, peer))
+        else:
+            allowed = peer in self.verified
+        if not allowed:
             try:
                 stream.close()
             except Exception:
                 pass
             raise httpcore2.ConnectError(
-                f"PEER_REJECTED: {peer!r} not in verified set"
+                f"PEER_REJECTED: {peer!r} not in authorized set"
             )
         return stream
 

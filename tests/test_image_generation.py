@@ -28,6 +28,7 @@ import threading
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpcore2
 import httpx2
@@ -436,6 +437,164 @@ class TestBackendAndTLS(unittest.TestCase):
     def test_backend_type_asserted_at_construction(self):
         with self.assertRaises(TypeError):
             PeerPolicyBackend("not-a-set")
+
+
+# ---------------------------------------------------------------------------
+# S4-B2 补充：PeerPolicyBackend peer 授权判断逻辑分支审查
+#
+# 任务书 §二 安全不变量（connect_tcp 判定链，离线 fake stream 验证）：
+#   1. peer is None -> 拒绝
+#   2. policy_state 存在 -> 严格集合成员校验（非 None 时不降级）
+#   3. on_peer 存在且无 policy_state -> 回调判定
+#   4. 两者皆无 -> verified 判定
+#   5. 拒绝时 stream 确实 close + ConnectError(PEER_REJECTED)
+#   6. 授权失败不降级到其他宽松路径
+#   7. policy_state 优先于 on_peer
+# 不触真实网络：mock super().connect_tcp 返回 fake stream。
+# ---------------------------------------------------------------------------
+
+class TestPeerPolicyBackendBranches(unittest.TestCase):
+    """§二 不变量逐分支验证（离线 fake stream，不触真实 socket/TLS）。"""
+
+    # 1) peer=None -> 拒绝
+    def test_peer_none_rejected(self):
+        b = PeerPolicyBackend({"127.0.0.1"})
+        stream = _make_fake_stream(peer=None)
+        with patch.object(
+            type(b).__mro__[1], "connect_tcp", return_value=stream):
+            with self.assertRaises(httpcore2.ConnectError) as ctx:
+                b.connect_tcp("10.0.0.1", 443)
+            self.assertIn("PEER_REJECTED", str(ctx.exception))
+        self.assertTrue(stream.closed, "peer=None 时 stream 必须 close")
+        # connect_log 记录 (host, None)
+        self.assertEqual(b.connect_log[-1][1], None)
+
+    # 2) policy_state 命中 -> 放行
+    def test_policy_state_hit_allows(self):
+        b = PeerPolicyBackend(set(), policy_state=frozenset({"127.0.0.1"}))
+        stream = _make_fake_stream(peer="127.0.0.1")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            out = b.connect_tcp("10.0.0.1", 443)
+        self.assertIs(out, stream)
+        self.assertFalse(stream.closed, "policy_state 命中不得 close")
+
+    # 2b) policy_state 不命中 -> 拒绝（不降级到 on_peer/verified）
+    def test_policy_state_miss_rejects(self):
+        b = PeerPolicyBackend({"127.0.0.1"},
+                              on_peer=lambda h, p, peer: True,
+                              policy_state=frozenset({"8.8.8.8"}))
+        stream = _make_fake_stream(peer="127.0.0.1")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            with self.assertRaises(httpcore2.ConnectError) as ctx:
+                b.connect_tcp("10.0.0.1", 443)
+        self.assertIn("PEER_REJECTED", str(ctx.exception))
+        self.assertTrue(stream.closed)
+        # 不变量 6：即使 verified/on_peer 都放行，policy_state 不命中仍拒绝
+
+    # 3) on_peer 返回 True -> 放行
+    def test_on_peer_true_allows(self):
+        b = PeerPolicyBackend(set(), on_peer=lambda h, p, peer: True)
+        stream = _make_fake_stream(peer="9.9.9.9")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            out = b.connect_tcp("10.0.0.1", 443)
+        self.assertIs(out, stream)
+        self.assertFalse(stream.closed)
+
+    # 3b) on_peer 返回 False -> 拒绝
+    def test_on_peer_false_rejects(self):
+        b = PeerPolicyBackend(set(), on_peer=lambda h, p, peer: False)
+        stream = _make_fake_stream(peer="9.9.9.9")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            with self.assertRaises(httpcore2.ConnectError) as ctx:
+                b.connect_tcp("10.0.0.1", 443)
+        self.assertIn("PEER_REJECTED", str(ctx.exception))
+        self.assertTrue(stream.closed, "on_peer=False 时 stream 必须 close")
+
+    # 4) verified 命中 -> 放行（默认路径，向后兼容）
+    def test_verified_hit_allows(self):
+        b = PeerPolicyBackend({"127.0.0.1"})
+        stream = _make_fake_stream(peer="127.0.0.1")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            out = b.connect_tcp("10.0.0.1", 443)
+        self.assertIs(out, stream)
+
+    # 4b) verified 不命中 -> 拒绝
+    def test_verified_miss_rejects(self):
+        b = PeerPolicyBackend({"127.0.0.1"})
+        stream = _make_fake_stream(peer="8.8.8.8")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            with self.assertRaises(httpcore2.ConnectError) as ctx:
+                b.connect_tcp("10.0.0.1", 443)
+        self.assertIn("PEER_REJECTED", str(ctx.exception))
+        self.assertTrue(stream.closed)
+
+    # 7) policy_state 优先于 on_peer（on_peer 放行也不生效）
+    def test_policy_state_takes_priority_over_on_peer(self):
+        called = []
+        def _on_peer(h, p, peer):
+            called.append(peer)
+            return True  # 即使放行
+        b = PeerPolicyBackend(set(), on_peer=_on_peer,
+                              policy_state=frozenset({"8.8.8.8"}))
+        stream = _make_fake_stream(peer="127.0.0.1")  # ∉ policy_state
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            with self.assertRaises(httpcore2.ConnectError):
+                b.connect_tcp("10.0.0.1", 443)
+        self.assertEqual(called, [],
+                         "policy_state 命中判定路径不得调用 on_peer")
+
+    # 构造契约：policy_state 非 frozenset -> TypeError
+    def test_policy_state_type_enforced(self):
+        with self.assertRaises(TypeError):
+            PeerPolicyBackend(set(), policy_state={"1.2.3.4"})
+
+    # connect_log 记录 (host, peer)（既有契约不变）
+    def test_connect_log_records(self):
+        b = PeerPolicyBackend({"127.0.0.1"})
+        stream = _make_fake_stream(peer="127.0.0.1")
+        with patch.object(type(b).__mro__[1], "connect_tcp", return_value=stream):
+            b.connect_tcp("10.0.0.1", 443)
+        self.assertEqual(b.connect_log, [("10.0.0.1", "127.0.0.1")])
+
+
+def _make_fake_stream(peer=None):
+    """构造 mock `httpcore2.SyncStream`：socket 存于 `_sock` 属性
+    （与真实 SyncStream.__init__ 的 `self._sock = sock` 结构一致，
+    connect_tcp 经属性探测 ("sock","_sock","socket","_stream") 读 peer）。"""
+    class _FakeSock:
+        def __init__(self, peer_ip):
+            self._peer_ip = peer_ip
+            self._closed = False
+        def getpeername(self):
+            if self._peer_ip is None:
+                raise OSError("no peer")
+            return (self._peer_ip, 443)
+        def close(self):
+            self._closed = True
+
+    class _FakeStream:
+        closed = False
+        def __init__(self):
+            self._sock = _FakeSock(peer)
+        def close(self):
+            self.closed = True
+            self._sock.close()
+    return _FakeStream()
+
+
+class TestSecurityHookG6(unittest.TestCase):
+    """G6：security_hook 注入契约（原 TestBackendAndTLS 的 hook 用例，
+    拆分独立类以便 mock 父类 connect_tcp 的离线分支测试不干扰回环 TLS 夹具）。"""
+
+    def _client_for(self, verified_ips, sni="api.openai.com"):
+        """复用 TestBackendAndTLS 的回环 TLS 服务器（同模块内由 unittest
+        先运行该类，setUpClass 已启动服务器；此处直接引用其夹具）。"""
+        if not getattr(TestBackendAndTLS, "server", None) or \
+                TestBackendAndTLS.server.cert_path is None:
+            raise unittest.SkipTest("回环 TLS 服务器不可用")
+        ctx = ssl.create_default_context(cafile=None)
+        ctx.load_verify_locations(TestBackendAndTLS.server.cert_path)
+        return build_secure_client(sni, verified_ips, ctx)
 
     def test_hook_missing_fails_closed(self):
         # A client whose _event_hooks dict lacks a "request" list must be

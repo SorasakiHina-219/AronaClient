@@ -851,6 +851,22 @@ class SettingsManager:
         if isinstance(extra, dict):
             clean_extra = {}
             for k, v in extra.items():
+                # S4-A：extra_params["result_hosts"] 为 list[str] 形态
+                # （结果 URL 主机白名单）。fail-closed：仅接受全部元素为 str
+                # 的 list；其他形态（字符串/非 list/含非 str 元素）一律丢弃。
+                if isinstance(k, str) and k.strip() == "result_hosts":
+                    # S4-A：list[str] 形态；S4-B2（F2）：保留原始 list[str]
+                    # （运行层 _clean_result_host 为最终闸，会丢弃 IP 字面量
+                    # 项并使「键存在但全无效」返回空集 = 配置无效 -> 拒绝
+                    # 下载）。此处不得预先过滤 IP 项——否则运行层无法区分
+                    # 「未配置」（键缺失）与「配置无效」（键在但全被丢弃），
+                    # 三态 fail-closed 依赖 settings.json 中键的存在性。
+                    if isinstance(v, list) and all(
+                            isinstance(e, str) and e.strip() for e in v):
+                        clean_extra["result_hosts"] = [
+                            e.strip() for e in v
+                        ]
+                    continue
                 if isinstance(k, str) and isinstance(v, (str, int, float, bool)):
                     clean_extra[k.strip()[:64]] = v
             if clean_extra:
