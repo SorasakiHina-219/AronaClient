@@ -1,0 +1,91 @@
+AronaClient Notices
+===================
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+Copyright (C) 2024-2026 SorasakiHina-219
+
+Third-party components
+----------------------
+
+The following third-party components are used by this project.
+Their respective licenses are included below.
+
+1. PySide6
+   License: LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+   Copyright: (C) Qt Company Ltd.
+   Source: https://pypi.org/project/PySide6/
+   Note: PySide6 is linked dynamically. Users may replace the
+   PySide6 library with a modified version. See the LICENSE file
+   for the full LGPL-3.0 terms.
+
+2. openai
+   License: Apache-2.0
+   Copyright: (C) OpenAI, Inc.
+   Source: https://pypi.org/project/openai/
+   Note: See https://www.apache.org/licenses/LICENSE-2.0 for the
+   full Apache-2.0 license text. This license includes a patent
+   grant from contributors.
+
+3. PyAutoGUI
+   License: BSD
+   Copyright: (C) Al Sweigart
+   Source: https://pypi.org/project/PyAutoGUI/
+
+4. Pillow
+   License: HPND (Python History Notice License)
+   Copyright: (C) Secret Labs AB, Fredrik Lundh
+   Source: https://pypi.org/project/Pillow/
+
+5. opencv-python
+   License: Apache-2.0
+   Copyright: (C) OpenCV Foundation
+   Source: https://pypi.org/project/opencv-python/
+   Note: See https://www.apache.org/licenses/LICENSE-2.0 for the
+   full Apache-2.0 license text.
+
+6. numpy
+   License: BSD-3-Clause
+   Copyright: (C) NumPy Developers
+   Source: https://pypi.org/project/numpy/
+
+7. keyring
+   License: MIT
+   Copyright: (C) Jason R. Coombs
+   Source: https://pypi.org/project/keyring/
+
+8. python-dotenv
+   License: BSD-3-Clause
+   Copyright: (C) Saurabh Kumar
+   Source: https://pypi.org/project/python-dotenv/
+
+9. Markdown
+   License: BSD-2-Clause
+   Copyright: (C) Python Markdown
+   Source: https://pypi.org/project/Markdown/
+
+10. SpeechRecognition
+    License: MIT
+    Copyright: (C) Anthony Zhang
+    Source: https://pypi.org/project/SpeechRecognition/
+
+Additional notices
+------------------
+
+- shiboken6 (LGPL-3.0): Transitive dependency of PySide6.
+  Distributed alongside PySide6.
+
+- SecretStorage (LGPL-3.0+): Transitive dependency of keyring on
+  Linux platforms. Not used on Windows.
+
+- pyautogui submodules (BSD): Transitive dependencies of PyAutoGUI.
+
+End of notices.

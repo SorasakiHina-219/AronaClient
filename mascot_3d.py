@@ -1,4 +1,19 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
+# Copyright (C) 2024-2026 SorasakiHina-219
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 桌面小人物的真实 3D 渲染（阶段 B 集成）
 
@@ -28,8 +43,9 @@ from PySide6.QtGui import QImage, QMatrix4x4, QSurfaceFormat, QVector3D
 # 配置
 # ================================================================
 
-MODEL_DIR = Path(r"E:\Arona_1.01")
-PMX_PATH = MODEL_DIR / "Arona_1.01.pmx"
+from path_utils import get_model_dir, get_pmx_path
+MODEL_DIR = get_model_dir()
+PMX_PATH = get_pmx_path("Arona_1.01.pmx")
 
 TEXTURE_MAX = 1024          # 贴图降采样上限（内存敏感）
 DEFAULT_HEIGHT = 320        # 桌面小人物高度（像素）—— 提高以获得更清楚的细节
