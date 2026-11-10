@@ -4451,13 +4451,16 @@ class AronaUI(QMainWindow):
 
     def __init__(
         self,
+        ai_client=None,
     ):
 
         super().__init__()
 
         ensure_local_directories()
 
-        self.ai_client = AIClient()
+        # T4：优先使用共享 AIClient（services.app_context.AppContext，由
+        # main.py 注入）；未注入时回退自构造（保持 L1 原有行为）。
+        self.ai_client = ai_client if ai_client is not None else AIClient()
 
         self.sidebar_visible = True
         self.desktop_transparent = False
@@ -7481,6 +7484,18 @@ class AronaUI(QMainWindow):
 
             return
 
+        # T4：跨 UI 单活动请求互斥（L1/L2 共享同一 AIClient 后，
+        # 本地 _ai_busy 只保护本窗口；共享 AppContext.ai_busy 保护跨窗口）。
+        # 注意：必须在"空消息早退"之后抢占，否则空输入会永久占用共享锁。
+        self._shared_ai_busy = False
+        try:
+            from services.app_context import AppContext
+            self._shared_ai_busy = AppContext.get().acquire_ai_busy(owner="L1")
+            if not self._shared_ai_busy:
+                return
+        except ImportError:
+            pass
+
         self.input.clear()
 
         current_attachments = [
@@ -7612,6 +7627,7 @@ class AronaUI(QMainWindow):
     ):
 
         self._ai_busy = False
+        self._release_shared_ai_busy()
 
         self.add_message(
             "assistant",
@@ -7632,6 +7648,7 @@ class AronaUI(QMainWindow):
     ):
 
         self._ai_busy = False
+        self._release_shared_ai_busy()
 
         self.add_message(
             "assistant",
@@ -7646,6 +7663,16 @@ class AronaUI(QMainWindow):
         self.stage_status.setText(
             "AI 请求失败，请检查设置。"
         )
+
+    def _release_shared_ai_busy(self):
+        """T4：释放跨 UI 共享 ai_busy（仅在本窗口持有时）。"""
+        if getattr(self, "_shared_ai_busy", False):
+            try:
+                from services.app_context import AppContext
+                AppContext.get().release_ai_busy()
+            except ImportError:
+                pass
+            self._shared_ai_busy = False
 
     # ========================================================
     # 新建对话

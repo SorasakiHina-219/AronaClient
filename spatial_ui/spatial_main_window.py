@@ -1158,6 +1158,16 @@ class SpatialMainWindow(QMainWindow):
     def _on_message_sent(self, text: str):
         if self._ai_busy:
             return
+        # T4：跨 UI 单活动请求互斥（L1/L2 共享同一 AIClient 后，本地
+        # _ai_busy 只保护本窗口；共享 AppContext.ai_busy 保护跨窗口）。
+        self._shared_ai_busy = False
+        try:
+            from services.app_context import AppContext
+            self._shared_ai_busy = AppContext.get().acquire_ai_busy(owner="L2")
+            if not self._shared_ai_busy:
+                return  # 另一 UI 有请求在途，保持"正在思考"前状态不变
+        except ImportError:
+            pass
         if self.stack.currentIndex() != self._page_index["chat"]:
             self.switch_page("chat")
         self.add_message("user", text)
@@ -1180,6 +1190,7 @@ class SpatialMainWindow(QMainWindow):
     @Slot(str)
     def _on_ai_finished(self, text: str):
         self._ai_busy = False
+        self._release_shared_ai_busy()
         self.add_message("assistant", text)
         self.home_page.set_status_text("Arona 正在等待你的消息～")
         self._scroll_to_bottom()
@@ -1189,12 +1200,23 @@ class SpatialMainWindow(QMainWindow):
     @Slot(str)
     def _on_ai_error(self, err: str):
         self._ai_busy = False
+        self._release_shared_ai_busy()
         self.home_page.set_status_text("请求失败，请检查配置")
         self.add_message("system", f"请求失败：{err}")
         QMessageBox.warning(
             self, "AI 请求失败",
             "无法连接 AI 服务。\n\n请检查设置中的 API Key 与服务商配置。",
         )
+
+    def _release_shared_ai_busy(self):
+        """T4：释放跨 UI 共享 ai_busy（仅在本窗口持有时）。"""
+        if getattr(self, "_shared_ai_busy", False):
+            try:
+                from services.app_context import AppContext
+                AppContext.get().release_ai_busy()
+            except ImportError:
+                pass
+            self._shared_ai_busy = False
 
     # ── 动作 ──────────────────────────────────────────────
 
