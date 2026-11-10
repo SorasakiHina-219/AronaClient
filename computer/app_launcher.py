@@ -60,6 +60,13 @@ DANGEROUS_EXECUTABLE_NAMES = {
 
 MAX_PATH_LENGTH = 4096
 
+# D1 修复：禁止从 Windows 系统目录启动可执行文件。
+# 小写前缀（与 _resolve_executable 内 .lower() 比较匹配，Windows 路径大小写不敏感）。
+# 单前缀 "c:\\windows" 经 startswith 已覆盖 System32/SysWOW64/Temp 全部子目录。
+SYSTEM_DIR_PREFIXES = (
+    "c:\\windows",
+)
+
 
 class AppLaunchError(Exception):
     """应用启动错误基类。"""
@@ -279,21 +286,14 @@ class AppLauncher:
                     raise AppLaunchError(
                         f"禁止启动高风险系统工具：{found}"
                     )
+                # D1 修复：系统目录前缀检查并入实际可达的 Case-2 命中分支
+                #（原 L291 检查位于不可达的 Case-3 死代码中，从未生效）。
+                for prefix in SYSTEM_DIR_PREFIXES:
+                    if found.lower().startswith(prefix.lower()):
+                        raise AppLaunchError(
+                            f"禁止从系统目录启动：{found}"
+                        )
                 return found
-
-        found = self._which(name_or_path)
-        if found:
-            exe_name = Path(found).name.lower()
-            if exe_name in DANGEROUS_EXECUTABLE_NAMES:
-                raise AppLaunchError(
-                    f"禁止启动高风险系统工具：{found}"
-                )
-            for prefix in SYSTEM_DIR_PREFIXES:
-                if found.lower().startswith(prefix.lower()):
-                    raise AppLaunchError(
-                        f"禁止从系统目录启动：{found}"
-                    )
-            return found
 
         return None
 
