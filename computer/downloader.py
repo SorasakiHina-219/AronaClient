@@ -694,7 +694,10 @@ class Downloader:
                     "message": "下载失败：DNS 解析结果异常。",
                 }
 
-            is_safe = (
+            # D2 修复：变量名 is_unsafe（原 is_safe 与语义相反——原名
+            # "safe" 为真时 IP 实为不安全）。True = 落在 私有/回环/链路
+            # 本地/保留/多播 任一类。纯重命名，判断逻辑 0 变化。
+            is_unsafe = (
                 ip.is_private
                 or ip.is_loopback
                 or ip.is_link_local
@@ -702,7 +705,7 @@ class Downloader:
                 or ip.is_multicast
             )
 
-            if is_safe:
+            if is_unsafe:
                 has_private = True
             else:
                 has_public = True
