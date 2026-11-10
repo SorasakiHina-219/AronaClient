@@ -29,7 +29,14 @@ def main():
 
     app = QApplication(sys.argv)
 
-    window = AronaUI()
+    # T4：L1 使用共享 AIClient（services.app_context.AppContext，与 L2 同一实例）；
+    # 未落地时回退 AronaUI 自构造行为，L1 功能零变化。
+    try:
+        from services.app_context import AppContext
+        _ctx = AppContext.get()
+        window = AronaUI(ai_client=_ctx.ai_client)
+    except ImportError:
+        window = AronaUI()
 
     print("AronaUI 创建成功：", type(window))
 

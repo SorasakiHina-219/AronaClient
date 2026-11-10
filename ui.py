@@ -24,6 +24,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
     Slot,
+    QPoint,
 )
 
 from PySide6.QtGui import (
@@ -55,6 +57,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -63,6 +66,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -112,6 +116,45 @@ except Exception as _awareness_error:
         _awareness_error,
     )
 
+# R12.3-07 M3：图片生成（默认关闭，fail-closed 导入）。
+#
+# 与桌面感知同款保护：模块本身或依赖出问题，
+# 只让「图片生成」按钮不可用，不影响聊天/语音/桌面功能。
+try:
+
+    from core.image_generation import (
+        ImageGenerationService,
+        ImageGenError,
+    )
+
+except Exception as _image_gen_error:
+
+    ImageGenerationService = None
+    ImageGenError = None
+
+    print(
+        "图片生成模块加载失败，该功能将不可用：",
+        _image_gen_error,
+    )
+
+# R13-MEDIA-01：多媒体能力（开放服务商图片 / 视频 / 语音，fail-closed 导入）。
+try:
+
+    from core.media_generation import (
+        MediaService,
+        MediaError,
+    )
+
+except Exception as _media_gen_error:
+
+    MediaService = None
+    MediaError = None
+
+    print(
+        "多媒体模块加载失败，视频/语音功能将不可用：",
+        _media_gen_error,
+    )
+
 
 # V0.1 桌面小人物。
 #
@@ -158,6 +201,50 @@ WORKSPACE_DIR = APP_DIR / "workspace"
 UPLOADS_DIR = WORKSPACE_DIR / "uploads"
 RESULTS_DIR = WORKSPACE_DIR / "results"
 TEMP_DIR = WORKSPACE_DIR / "temp"
+
+# R12.3-07 M3：图片生成门禁错误码 -> 用户安全文案（G7 固定分类）。
+_IMAGE_GEN_ERR_MESSAGES = {
+    "FEATURE_DISABLED": "图片生成未开启，请在设置中启用。",
+    "PROVIDER_NOT_REGISTERED": "该图片服务商未配置。",
+    "UNSUPPORTED_PROTOCOL": "该协议尚未实现（第一阶段仅 OpenAI）。",
+    "CREDENTIAL_MISSING": "缺少 API Key，请打开设置填写。",
+    "CONNECT_TARGET_UNBOUND": "无法验证连接目标，已拒绝。",
+    "DNS_RESOLUTION_FAILED": "域名解析失败。",
+    "CONNECT_PEER_REJECTED": "连接目标校验失败，已拒绝。",
+    "TLS_VERIFICATION_FAILED": "TLS 证书验证失败，已拒绝。",
+    "REDIRECT_REJECTED": "检测到重定向，已拒绝。",
+    "REQUEST_TIMEOUT": "请求超时。",
+    "RATE_LIMITED": "服务商限流，请稍后再试。",
+    "PROVIDER_ERROR": "服务商异常。",
+    "INVALID_IMAGE_RESPONSE": "生成结果无效。",
+    "IMAGE_DECODE_FAILED": "图片解码失败，已丢弃。",
+    "OUTPUT_TOO_LARGE": "结果超出大小上限。",
+    "INTERNAL_ERROR": "内部错误。",
+}
+
+# R13-MEDIA-01：多媒体错误码 -> 用户安全文案（MediaError 固定分类）。
+_MEDIA_ERR_MESSAGES = {
+    "SERVICE_DISABLED": "该服务未启用，请在设置中开启并配置服务商。",
+    "PROVIDER_NOT_CONFIGURED": "该服务商未配置，请在设置中添加。",
+    "CREDENTIAL_MISSING": "缺少 API Key，请在设置中填写。",
+    "UNSUPPORTED_PROTOCOL": "该协议尚未实现。",
+    "INVALID_BASE_URL": "API 地址需以 https:// 开头。",
+    "CONNECT_TARGET_UNBOUND": "无法验证连接目标，已拒绝。",
+    "DNS_RESOLUTION_FAILED": "域名解析失败。",
+    "CONNECT_PEER_REJECTED": "连接目标校验失败，已拒绝。",
+    "TLS_VERIFICATION_FAILED": "TLS 证书验证失败，已拒绝。",
+    "REQUEST_TIMEOUT": "请求超时。",
+    "RATE_LIMITED": "服务商限流，请稍后再试。",
+    "PROVIDER_ERROR": "服务商异常。",
+    "TASK_FAILED": "任务失败。",
+    "TASK_TIMEOUT": "任务轮询超时。",
+    "INVALID_RESPONSE": "服务商返回结果无效。",
+    "DOWNLOAD_FAILED": "结果下载失败。",
+    "DECODE_FAILED": "结果解码失败，已丢弃。",
+    "OUTPUT_TOO_LARGE": "结果超出大小上限。",
+    "FILE_NOT_FOUND": "源文件不存在或不可读。",
+    "INTERNAL_ERROR": "内部错误。",
+}
 
 APPEARANCE_FILE = APPEARANCE_DIR / "appearance.json"
 
@@ -728,6 +815,116 @@ class AwarenessReplyWorker(QObject):
             self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ============================================================
+# 图片生成后台任务（R12.3-07 M3 / G9）
+# ============================================================
+
+class ImageGenWorker(QObject):
+    """
+    在后台线程里执行一次图片生成。
+
+    与 AwarenessReplyWorker 使用同一套 QThread + moveToThread 写法，
+    避免网络请求期间卡住界面。所有安全门禁与连接绑定逻辑在
+    core.image_generation 内（M1），这里只负责线程化与结果回传。
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        service,
+        prompt,
+        size="1024x1024",
+        quality="low",
+        model="",
+    ):
+        super().__init__()
+        self.service = service
+        self.prompt = prompt
+        self.size = size
+        self.quality = quality
+        self.model = model
+
+    @Slot()
+    def run(self):
+        try:
+            path = self.service.generate(
+                prompt=self.prompt,
+                size=self.size,
+                quality=self.quality,
+                model=self.model,
+            )
+            self.finished.emit(path)
+        except Exception as exc:
+            # G7：只回传固定分类的用户安全消息，不回传 SDK 原文。
+            msg = getattr(exc, "user_message", None)
+            if not msg:
+                msg = str(exc)
+            self.error.emit(msg)
+
+
+# ============================================================
+# 多媒体后台任务（R13-MEDIA-01：视频生成 / 语音合成 / 语音识别）
+# ============================================================
+
+class MediaWorker(QObject):
+    """在后台线程里执行一次多媒体任务（视频/语音）。
+
+    与 ImageGenWorker 同款 QThread + moveToThread 写法；
+    门禁、连接绑定、协议解析在 core.media_generation 内，
+    这里只负责线程化与结果/错误回传（固定安全文案，G7）。
+    """
+
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, service, action, **params):
+        super().__init__()
+        self.service = service
+        self.action = action
+        self.params = params
+
+    @Slot()
+    def run(self):
+        try:
+            if self.action == "video":
+                self.progress.emit("提交视频任务……")
+                task = self.service.start_video(
+                    prompt=self.params.get("prompt", ""),
+                    provider_id=self.params.get("provider_id", ""),
+                )
+                self.progress.emit("轮询视频任务状态……")
+                path = self.service.wait_video_task(task)
+                self.finished.emit(path)
+            elif self.action == "voice":
+                self.progress.emit("合成语音中……")
+                path = self.service.synthesize_voice(
+                    text=self.params.get("text", ""),
+                    voice=self.params.get("voice", "alloy"),
+                    provider_id=self.params.get("provider_id", ""),
+                )
+                self.finished.emit(path)
+            elif self.action == "stt":
+                self.progress.emit("识别语音中……")
+                text = self.service.transcribe_voice(
+                    audio_path=self.params.get("audio_path", ""),
+                    language=self.params.get("language", "zh"),
+                    provider_id=self.params.get("provider_id", ""),
+                )
+                self.finished.emit(text)
+            else:
+                raise MediaError.internal_error(self.action, "")
+        except Exception as exc:
+            msg = getattr(exc, "user_message", None)
+            if not msg:
+                import core.media_generation as _mg
+                code = getattr(exc, "code", "")
+                msg = _mg.MediaError.code_map_get(code, self.action, "")
+            self.error.emit(msg)
 
 
 # ============================================================
@@ -2571,6 +2768,12 @@ class SettingsDialog(QDialog):
         )
 
         # ----------------------------------------------------
+        # R13-MEDIA-01：多媒体服务（图片 / 视频 / 语音 独立配置）
+        # ----------------------------------------------------
+
+        self._build_media_services_section(content_layout)
+
+        # ----------------------------------------------------
         # 状态
         # ----------------------------------------------------
 
@@ -3265,6 +3468,359 @@ class SettingsDialog(QDialog):
     # 当前设置
     # ========================================================
 
+    def _build_media_services_section(self, content_layout):
+        """R13-MEDIA-01：图片/视频/语音服务商配置（相互独立，开放添加/删除）。
+
+        每个 service 一张卡片：启用开关 + 当前服务商选择 + 添加/删除按钮
+        + 当前服务商的 API 地址 / 模型 / 协议 / API Key 编辑行。
+        密钥只写 keyring（SettingsManager 的 media keyring 路径），
+        卡片里只显示「已配置/未配置」状态，不显示明文。
+        """
+        media_card = QFrame()
+        media_card.setObjectName("settingsCard")
+        media_layout = QVBoxLayout(media_card)
+        media_layout.setContentsMargins(20, 20, 20, 20)
+        media_layout.setSpacing(10)
+
+        title = QLabel("多媒体服务")
+        title.setObjectName("settingsSectionTitle")
+        media_layout.addWidget(title)
+
+        hint = QLabel(
+            "图片 / 视频 / 语音各自独立配置服务商。\n"
+            "API Key 保存到 Windows 凭据管理器；"
+            "删除服务商只会删除它自己的密钥，不影响其他服务。"
+        )
+        hint.setObjectName("settingsSubtitle")
+        hint.setWordWrap(True)
+        media_layout.addWidget(hint)
+
+        # 初始化容器（只建一次，避免被 _build_media_service_row 反复重置）
+        self._media_param_widgets = {}
+        self._media_sections_box = {}
+
+        service_titles = {
+            "image": "图片生成",
+            "video": "视频生成",
+            "voice": "语音（合成 / 识别）",
+        }
+        for service in ("image", "video", "voice"):
+            self._media_param_widgets[service] = self._build_media_service_row(
+                media_layout, service, service_titles[service]
+            )
+
+        content_layout.addWidget(media_card)
+
+    def _build_media_service_row(self, parent_layout, service, display):
+        """单个 service 的配置行（启用 + 服务商选择 + 参数编辑 + 增删）。
+
+        返回 widgets dict；由调用方负责存入 _media_param_widgets[service]。
+        """
+        section_box = QFrame()
+        section_box.setStyleSheet(
+            "QFrame { background: #0A0A0A; border: 1px solid #252525; "
+            "border-radius: 10px; }"
+        )
+        vbox = QVBoxLayout(section_box)
+        vbox.setContentsMargins(14, 12, 14, 12)
+        vbox.setSpacing(8)
+
+        head = QHBoxLayout()
+        head_label = QLabel(f"🖼 {display}" if service == "image"
+                            else f"🎬 {display}" if service == "video"
+                            else f"🎙 {display}")
+        head_label.setObjectName("settingsSectionTitle")
+        head.addWidget(head_label)
+        head.addStretch()
+
+        enabled_box = QCheckBox("启用")
+        self._media_sections_box[(service, "enabled")] = enabled_box
+        head.addWidget(enabled_box)
+        vbox.addLayout(head)
+
+        # 服务商选择 + 添加/删除
+        provider_row = QHBoxLayout()
+        provider_label = QLabel("服务商")
+        provider_combo = QComboBox()
+        provider_row.addWidget(provider_label)
+        provider_row.addWidget(provider_combo, 1)
+
+        add_button = QPushButton("添加")
+        add_button.clicked.connect(
+            lambda _=False, s=service, c=provider_combo:
+            self._media_add_provider(s, c)
+        )
+        del_button = QPushButton("删除")
+        del_button.clicked.connect(
+            lambda _=False, s=service, c=provider_combo:
+            self._media_remove_provider(s, c)
+        )
+        provider_row.addWidget(add_button)
+        provider_row.addWidget(del_button)
+        vbox.addLayout(provider_row)
+
+        # 参数编辑
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        base_url_edit = QLineEdit()
+        base_url_edit.setPlaceholderText("https://api.openai.com/v1")
+        model_edit = QLineEdit()
+        model_edit.setPlaceholderText("模型名称")
+        protocol_combo = QComboBox()
+        protocol_combo.setEditable(True)
+        default_protocols = {
+            "image": ["openai", "generic-image"],
+            "video": ["openai-video-task", "generic-video"],
+            "voice": ["openai-audio"],
+        }
+        for p in default_protocols.get(service, []):
+            protocol_combo.addItem(p)
+        api_key_edit = QLineEdit()
+        api_key_edit.setEchoMode(QLineEdit.Password)
+        api_key_edit.setPlaceholderText("留空 = 不修改 / 填写 = 更新")
+
+        form.addRow("API 地址", base_url_edit)
+        form.addRow("模型", model_edit)
+        form.addRow("协议", protocol_combo)
+        form.addRow("API Key", api_key_edit)
+        vbox.addLayout(form)
+
+        # 密钥状态
+        key_status = QLabel("")
+        key_status.setObjectName("settingsSubtitle")
+        vbox.addWidget(key_status)
+
+        widgets = {
+            "combo": provider_combo,
+            "enabled": enabled_box,
+            "base_url": base_url_edit,
+            "model": model_edit,
+            "protocol": protocol_combo,
+            "api_key": api_key_edit,
+            "key_status": key_status,
+        }
+
+        # 数据加载（延迟到 load_current / refresh）
+        provider_combo.currentIndexChanged.connect(
+            lambda _=None, s=service: self._media_refresh_row(s)
+        )
+        enabled_box.toggled.connect(
+            lambda _=None, s=service: self._media_refresh_row(s)
+        )
+
+        self._media_sections_box[(service, "box")] = section_box
+        parent_layout.addWidget(section_box)
+        return widgets
+
+    # ---------------- media helper methods ----------------
+
+    def _media_all_providers(self, service):
+        section = self.settings.get_media_service_section(service)
+        return section.get("providers", {})
+
+    def _media_refresh_row(self, service):
+        """根据当前选中服务商刷新参数行 + 密钥状态（不触发保存）。"""
+        w = self._media_param_widgets.get(service)
+        if not w:
+            return
+        combo = w["combo"]
+        block = combo.blockSignals(True)
+        providers = self._media_all_providers(service)
+        current = self.settings.get_media_service_section(service).get("provider", "")
+        combo.clear()
+        combo.addItem("(未配置)", "")
+        for pid in providers:
+            pname = providers[pid].get("name", pid)
+            combo.addItem(f"{pname} ({pid})", pid)
+        idx = combo.findData(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(block)
+
+        sel = combo.currentData() or ""
+        if sel:
+            pconf = self.settings.get_media_provider_config(service, sel) or {}
+            w["base_url"].setText(pconf.get("base_url", ""))
+            w["model"].setText(pconf.get("model", ""))
+            proto = pconf.get("protocol", "")
+            pidx = w["protocol"].findText(proto)
+            if pidx >= 0:
+                w["protocol"].setCurrentIndex(pidx)
+            has_key = self.settings.has_media_api_key(service, sel)
+            w["key_status"].setText(
+                "● 已配置 API Key" if has_key else "● 未配置 API Key"
+            )
+            w["api_key"].setText("")
+            w["api_key"].setPlaceholderText(
+                "已保存（留空=不修改；填写=更新；删除服务商时才清除）"
+                if has_key else "在此输入 API Key"
+            )
+        else:
+            w["base_url"].clear()
+            w["model"].clear()
+            w["key_status"].setText("● 未配置服务商")
+
+    def _media_add_provider(self, service, combo):
+        """弹出对话框收集新服务商字段，写入设置（密钥单独保存）。"""
+        name, base_url, model, protocol, extra = self._media_provider_input(
+            service, title="添加服务商"
+        )
+        if not name or not base_url:
+            return
+        provider_id = re.sub(
+            r"[^a-z0-9_-]", "_", name.lower()[:32]
+        ) or "provider"
+        # 唯一化：重名加后缀
+        existing = set(self._media_all_providers(service))
+        base_pid = provider_id
+        n = 2
+        while provider_id in existing:
+            provider_id = f"{base_pid}_{n}"
+            n += 1
+        entry = {
+            "name": name,
+            "base_url": base_url,
+            "model": model,
+            "protocol": protocol or "openai" if service == "image"
+            else ("openai-video-task" if service == "video" else "openai-audio"),
+        }
+        if extra:
+            entry["extra_params"] = extra
+        try:
+            self.settings.add_media_provider(service, provider_id, entry)
+            self.settings.set_media_service_provider(service, provider_id)
+        except Exception as e:
+            QMessageBox.critical(self, "添加失败", str(e))
+            return
+        self._media_refresh_row(service)
+
+    def _media_provider_input(self, service, title):
+        """收集服务商 5 字段；extra 以 JSON 形式解析（可选）。
+
+        返回 (name, base_url, model, protocol, extra_dict_or_None)。
+        用户取消 -> (None,)*5。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(480)
+        dlg.setStyleSheet(self.styleSheet() or "")
+        lay = QFormLayout(dlg)
+        lay.setSpacing(8)
+
+        name_e = QLineEdit()
+        name_e.setPlaceholderText("例如：OpenAI / 智谱 / 自部署网关")
+        url_e = QLineEdit()
+        url_e.setPlaceholderText("https://api.openai.com/v1")
+        model_e = QLineEdit()
+        model_e.setPlaceholderText("gpt-image-1 / sora-2 / gpt-4o-mini-tts")
+        proto_combo = QComboBox()
+        proto_combo.setEditable(True)
+        protos = {
+            "image": ["openai", "generic-image"],
+            "video": ["openai-video-task", "generic-video"],
+            "voice": ["openai-audio"],
+        }
+        for p in protos.get(service, ["openai"]):
+            proto_combo.addItem(p)
+        extra_e = QLineEdit()
+        extra_e.setPlaceholderText(
+            "可选，JSON 形式，例如 {\"size\":\"1024x1024\",\"poll_path\":\"/videos/{task_id}\"}"
+        )
+        lay.addRow("名称", name_e)
+        lay.addRow("API 地址", url_e)
+        lay.addRow("模型", model_e)
+        lay.addRow("协议", proto_combo)
+        lay.addRow("扩展参数", extra_e)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("取消")
+        ok = QPushButton("确定")
+        ok.setObjectName("primaryButton")
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(ok)
+        lay.addLayout(btn_row)
+
+        cancel.clicked.connect(dlg.reject)
+        ok.clicked.connect(dlg.accept)
+        if dlg.exec() != QDialog.Accepted:
+            return (None,) * 5
+
+        name = name_e.text().strip()
+        base_url = url_e.text().strip()
+        model = model_e.text().strip()
+        protocol = proto_combo.currentText().strip()
+        extra_raw = extra_e.text().strip()
+        extra = None
+        if extra_raw:
+            try:
+                parsed = json.loads(extra_raw)
+                if isinstance(parsed, dict):
+                    extra = parsed
+                else:
+                    raise ValueError("扩展参数必须是 JSON 对象")
+            except Exception as e:
+                QMessageBox.warning(self, "扩展参数无效", f"JSON 解析失败：{e}")
+                return (None,) * 5
+        return name, base_url, model, protocol, extra
+
+    def _media_remove_provider(self, service, combo):
+        sel = combo.currentData() or ""
+        if not sel:
+            QMessageBox.information(
+                self, "无可删除", "请先选择一个服务商。"
+            )
+            return
+        pconf = self.settings.get_media_provider_config(service, sel) or {}
+        pname = pconf.get("name", sel)
+        ans = QMessageBox.question(
+            self,
+            "删除服务商",
+            f"删除「{pname}」？\n"
+            "它会同时删除该服务商自己的 API Key，\n"
+            "不影响其他服务商或其他服务的密钥。",
+        )
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            self.settings.remove_media_provider(service, sel)
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", str(e))
+            return
+        self._media_refresh_row(service)
+
+    def _media_save_rows(self):
+        """保存所有 service 行的启用状态与参数（密钥单独处理）。"""
+        for service, w in self._media_param_widgets.items():
+            enabled = w["enabled"].isChecked()
+            self.settings.set_media_service_enabled(service, enabled)
+
+            sel = w["combo"].currentData() or ""
+            self.settings.set_media_service_provider(service, sel)
+
+            if sel:
+                entry = {
+                    "name": sel,
+                    "base_url": w["base_url"].text().strip(),
+                    "model": w["model"].text().strip(),
+                    "protocol": w["protocol"].currentText().strip(),
+                }
+                try:
+                    self.settings.add_media_provider(service, sel, entry)
+                except Exception as e:
+                    QMessageBox.critical(self, "保存失败", f"{service}: {e}")
+                    return
+
+            key_val = w["api_key"].text().strip()
+            if key_val and sel:
+                try:
+                    self.settings.set_media_api_key(service, sel, key_val)
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, "密钥保存失败", f"{service}/{sel}: {e}"
+                    )
+
     def load_current(
         self,
     ):
@@ -3288,6 +3844,14 @@ class SettingsDialog(QDialog):
         self.refresh_profile_preview()
 
         self.refresh_background_preview()
+
+        # R13-MEDIA-01：刷新多媒体服务行（图片/视频/语音）
+        if hasattr(self, "_media_param_widgets"):
+            for service in self._media_param_widgets:
+                w = self._media_param_widgets[service]
+                sec = self.settings.get_media_service_section(service)
+                w["enabled"].setChecked(sec.get("enabled") is True)
+                self._media_refresh_row(service)
 
     def on_provider_changed(
         self,
@@ -3439,6 +4003,13 @@ class SettingsDialog(QDialog):
             )
 
             self.ai_client.reload()
+
+            # -----------------------------------------------
+            # R13-MEDIA-01：保存多媒体服务（图片/视频/语音）
+            # -----------------------------------------------
+
+            if hasattr(self, "_media_param_widgets"):
+                self._media_save_rows()
 
             # -----------------------------------------------
             # 保存第一阶段个性化设置
@@ -3895,13 +4466,16 @@ class AronaUI(QMainWindow):
 
     def __init__(
         self,
+        ai_client=None,
     ):
 
         super().__init__()
 
         ensure_local_directories()
 
-        self.ai_client = AIClient()
+        # T4：优先使用共享 AIClient（services.app_context.AppContext，由
+        # main.py 注入）；未注入时回退自构造（保持 L1 原有行为）。
+        self.ai_client = ai_client if ai_client is not None else AIClient()
 
         self.sidebar_visible = True
         self.desktop_transparent = False
@@ -4011,6 +4585,16 @@ class AronaUI(QMainWindow):
         self._desktop_vision_busy = False  # 防止重复触发截图分析任务
         self._awareness_reply_busy = False  # 防止重复提交 AI 回复请求
         self.awareness_reply_threads = []  # 追踪感知回复线程
+
+        # ── R12.3-07 M3：图片生成 ──
+        self.image_gen_threads = []      # 追踪图片生成线程 (thread, worker)
+        self._image_gen_busy = False     # 防止重复提交
+        self._image_gen_service_obj = None  # 惰性构造（门禁不满足时不建网络）
+
+        # ── R13-MEDIA-01：视频 / 语音 ──
+        self.media_threads = []          # 追踪视频/语音后台线程 (thread, worker)
+        self._media_busy = False        # 防止重复提交
+        self._media_service_obj = None   # 惰性构造 MediaService
 
         self.speech_thread = None
         self.speech_worker = None
@@ -4539,12 +5123,68 @@ class AronaUI(QMainWindow):
             self.open_settings
         )
 
+        # R12.3-07 M3：图片生成入口（默认关闭；门禁不满足时拒绝，零网络）。
+        image_gen_button = QToolButton()
+
+        image_gen_button.setText(
+            "🖼"
+        )
+
+        image_gen_button.setToolTip(
+            "生成图片（需在设置中开启并配置 API Key）"
+        )
+
+        image_gen_button.clicked.connect(
+            self.start_image_generation
+        )
+
         top_layout.addWidget(
             self.model_toggle
         )
 
         top_layout.addWidget(
             fullscreen_button
+        )
+
+        top_layout.addWidget(
+            image_gen_button
+        )
+
+        # R13-MEDIA-01：视频 / 语音生成入口（默认关闭；门禁不满足时拒绝，零网络）。
+        video_gen_button = QToolButton()
+
+        video_gen_button.setText(
+            "🎬"
+        )
+
+        video_gen_button.setToolTip(
+            "生成视频（需在设置中开启并配置服务商）"
+        )
+
+        video_gen_button.clicked.connect(
+            self.start_video_generation
+        )
+
+        voice_gen_button = QToolButton()
+
+        voice_gen_button.setText(
+            "🎙"
+        )
+
+        voice_gen_button.setToolTip(
+            "语音合成 / 识别（需在设置中开启并配置服务商）"
+        )
+
+        voice_gen_button.clicked.connect(
+            self.open_voice_menu
+        )
+
+        top_layout.addWidget(
+            video_gen_button
+        )
+
+        top_layout.addWidget(
+            voice_gen_button
         )
 
         top_layout.addWidget(
@@ -6859,6 +7499,18 @@ class AronaUI(QMainWindow):
 
             return
 
+        # T4：跨 UI 单活动请求互斥（L1/L2 共享同一 AIClient 后，
+        # 本地 _ai_busy 只保护本窗口；共享 AppContext.ai_busy 保护跨窗口）。
+        # 注意：必须在"空消息早退"之后抢占，否则空输入会永久占用共享锁。
+        self._shared_ai_busy = False
+        try:
+            from services.app_context import AppContext
+            self._shared_ai_busy = AppContext.get().acquire_ai_busy(owner="L1")
+            if not self._shared_ai_busy:
+                return
+        except ImportError:
+            pass
+
         self.input.clear()
 
         current_attachments = [
@@ -6990,6 +7642,7 @@ class AronaUI(QMainWindow):
     ):
 
         self._ai_busy = False
+        self._release_shared_ai_busy()
 
         self.add_message(
             "assistant",
@@ -7010,6 +7663,7 @@ class AronaUI(QMainWindow):
     ):
 
         self._ai_busy = False
+        self._release_shared_ai_busy()
 
         self.add_message(
             "assistant",
@@ -7024,6 +7678,16 @@ class AronaUI(QMainWindow):
         self.stage_status.setText(
             "AI 请求失败，请检查设置。"
         )
+
+    def _release_shared_ai_busy(self):
+        """T4：释放跨 UI 共享 ai_busy（仅在本窗口持有时）。"""
+        if getattr(self, "_shared_ai_busy", False):
+            try:
+                from services.app_context import AppContext
+                AppContext.get().release_ai_busy()
+            except ImportError:
+                pass
+            self._shared_ai_busy = False
 
     # ========================================================
     # 新建对话
@@ -7109,6 +7773,342 @@ class AronaUI(QMainWindow):
                 path,
                 "image",
             )
+
+    # ========================================================
+    # R12.3-07 M3：图片生成入口（后台线程，G9）
+    # ========================================================
+
+    def _image_gen_service(self):
+        """惰性构造图片生成服务（门禁不满足时返回 None，零网络）。
+
+        注意：方法名与实例属性 `_image_gen_service` 同名，
+        Python 实例属性优先于方法查找。构造成功后将服务存入
+        私有槽 `_image_gen_service_obj`，避免属性遮蔽方法。
+        """
+        if ImageGenerationService is None:
+            return None
+        if self._image_gen_service_obj is None:
+            try:
+                self._image_gen_service_obj = ImageGenerationService(
+                    settings=self.ai_client.settings,
+                    results_dir=RESULTS_DIR,
+                )
+            except Exception:
+                return None
+        return self._image_gen_service_obj
+
+    def _media_service(self):
+        """惰性构造多媒体服务（门禁不满足时返回 None，零网络）。
+
+        与 _image_gen_service 同款：用 _media_service_obj 槽避免
+        同名实例属性遮蔽方法（R12.3-10 F3 教训）。
+        """
+        if MediaService is None:
+            return None
+        if self._media_service_obj is None:
+            try:
+                self._media_service_obj = MediaService(
+                    settings=self.ai_client.settings,
+                    results_dir=RESULTS_DIR,
+                )
+            except Exception:
+                return None
+        return self._media_service_obj
+
+    def start_image_generation(self):
+        """从聊天输入框读取提示词，提交后台生成任务。"""
+        if self._image_gen_busy:
+            return
+
+        prompt = self.input.toPlainText().strip()
+        if not prompt:
+            QMessageBox.information(
+                self,
+                "请输入描述",
+                "请在下方输入你想生成的图片描述。",
+            )
+            return
+
+        service = self._image_gen_service()
+        if service is None:
+            self._show_image_gen_error("图片生成模块不可用。")
+            return
+
+        ok, err_code = service.is_available()
+        if not ok:
+            if err_code == "CREDENTIAL_MISSING":
+                QMessageBox.information(
+                    self,
+                    "缺少 API Key",
+                    "请先在设置中填入 OpenAI 图片 API Key，并开启图片生成。",
+                )
+            else:
+                msg = _IMAGE_GEN_ERR_MESSAGES.get(
+                    err_code, "图片生成当前不可用。"
+                )
+                self._show_image_gen_error(msg)
+            return
+
+        # 占用输入框：清空并把提示作为展示消息。
+        self.input.clear()
+        self.add_message("user", f"🖼 {prompt}")
+        self.stage_status.setText("正在生成图片……")
+        self._image_gen_busy = True
+
+        thread = QThread(self)
+        worker = ImageGenWorker(service, prompt)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_image_gen_finished)
+        worker.error.connect(self._on_image_gen_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        pair = (thread, worker)
+        self.image_gen_threads.append(pair)
+        thread.finished.connect(
+            lambda p=pair: self._remove_image_gen_thread(p)
+        )
+        thread.start()
+
+    def _on_image_gen_finished(self, path):
+        self._image_gen_busy = False
+        try:
+            self.add_message("assistant", f"✅ 图片已生成：{path.name}")
+            self._show_image_in_bubble(str(path))
+        except Exception:
+            self.add_message("assistant", f"✅ 图片已生成：{path}")
+        self.stage_status.setText("图片生成完成～")
+
+    def _on_image_gen_error(self, error_text):
+        self._image_gen_busy = False
+        self._show_image_gen_error(error_text)
+
+    def _show_image_gen_error(self, text):
+        self.add_message("assistant", f"⚠️ {text}")
+        self.stage_status.setText("图片生成失败。")
+
+    def _show_image_in_bubble(self, path):
+        """把生成图作为附件加进聊天区（复用现有附件渲染）。"""
+        try:
+            if Path(path).exists():
+                self.add_attachment(path, "image")
+        except Exception:
+            pass
+
+    def _remove_image_gen_thread(self, pair):
+        if pair in self.image_gen_threads:
+            self.image_gen_threads.remove(pair)
+
+    # ------------------------------------------------------------------
+    # R13-MEDIA-01：视频 / 语音 生成入口
+    # ------------------------------------------------------------------
+
+    def start_video_generation(self):
+        """从聊天输入框读取提示词，提交后台视频生成任务。"""
+        if self._media_busy:
+            return
+
+        prompt = self.input.toPlainText().strip()
+        if not prompt:
+            QMessageBox.information(
+                self,
+                "请输入描述",
+                "请在下方输入你想生成的视频描述。",
+            )
+            return
+
+        service = self._media_service()
+        if service is None:
+            self._show_media_error("多媒体模块不可用。", "video")
+            return
+
+        ok, err_code = service.is_available("video")
+        if not ok:
+            self._show_media_error(_MEDIA_ERR_MESSAGES.get(err_code, "视频生成不可用。"), "video")
+            return
+
+        self.input.clear()
+        self.add_message("user", f"🎬 {prompt}")
+        self.stage_status.setText("正在提交视频任务……")
+        self._media_busy = True
+
+        self._run_media_action("video", prompt=prompt)
+
+    def open_voice_menu(self):
+        """语音入口菜单：合成（从输入框）/ 识别（本地文件）。"""
+        menu = QMenu(self)
+
+        act_synth = menu.addAction("🔊 语音合成（输入框文本）")
+        act_stt = menu.addAction("🎙 语音识别（选择音频文件）")
+        menu.addSeparator()
+        act_open = menu.addAction("⚙ 打开多媒体设置")
+
+        chosen = menu.exec(self.mapToGlobal(QPoint(0, 0)))
+
+        if chosen == act_synth:
+            self._voice_synthesize()
+        elif chosen == act_stt:
+            self._voice_transcribe()
+        elif chosen == act_open:
+            self.open_settings()
+
+    def _voice_synthesize(self):
+        if self._media_busy:
+            return
+        text = self.input.toPlainText().strip()
+        if not text:
+            QMessageBox.information(
+                self,
+                "请输入文本",
+                "请在下方输入要合成的文本。",
+            )
+            return
+        service = self._media_service()
+        if service is None:
+            self._show_media_error("多媒体模块不可用。", "voice")
+            return
+        ok, err_code = service.is_available("voice")
+        if not ok:
+            self._show_media_error(_MEDIA_ERR_MESSAGES.get(err_code, "语音合成不可用。"), "voice")
+            return
+        self.input.clear()
+        self.add_message("user", f"🔊 {text[:40]}")
+        self.stage_status.setText("正在合成语音……")
+        self._media_busy = True
+        self._run_media_action("voice", text=text)
+
+    def _voice_transcribe(self):
+        if self._media_busy:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择音频文件",
+            "",
+            "音频 (*.mp3 *.wav *.ogg *.flac *.m4a *.webm *.mp4);;所有文件 (*)",
+        )
+        if not path:
+            return
+        service = self._media_service()
+        if service is None:
+            self._show_media_error("多媒体模块不可用。", "voice")
+            return
+        ok, err_code = service.is_available("voice")
+        if not ok:
+            self._show_media_error(_MEDIA_ERR_MESSAGES.get(err_code, "语音识别不可用。"), "voice")
+            return
+        self.add_message("user", f"🎙 识别：{Path(path).name}")
+        self.stage_status.setText("正在识别语音……")
+        self._media_busy = True
+        self._run_media_action("stt", audio_path=path)
+
+    def _run_media_action(self, action, **params):
+        """把一次多媒体任务放到后台 QThread（与图片生成同款生命周期）。"""
+        service = self._media_service()
+        thread = QThread(self)
+        worker = MediaWorker(service, action, **params)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_media_finished)
+        worker.error.connect(self._on_media_error)
+        worker.progress.connect(self._on_media_progress)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        pair = (thread, worker, action)
+        self.media_threads.append(pair)
+        thread.finished.connect(
+            lambda p=pair: self._remove_media_thread(p)
+        )
+        thread.start()
+
+    def _on_media_finished(self, result):
+        self._media_busy = False
+        if isinstance(result, str) and result and not result.startswith(("✅", "⚠")):
+            # STT 返回识别文本
+            try:
+                path_name = Path(result).name if result else ""
+            except Exception:
+                path_name = ""
+            self.add_message("assistant", f"✅ 语音识别结果：{result}")
+            self.stage_status.setText("语音识别完成～")
+        else:
+            try:
+                name = Path(result).name
+            except Exception:
+                name = str(result)
+            self.add_message("assistant", f"✅ 生成完成：{name}")
+            try:
+                if Path(result).exists():
+                    self.add_attachment(str(result), "image" if "img_" in name else "file")
+            except Exception:
+                pass
+            self.stage_status.setText("多媒体任务完成～")
+
+    def _on_media_error(self, error_text):
+        self._media_busy = False
+        self._show_media_error(error_text, "")
+
+    def _on_media_progress(self, text):
+        self.stage_status.setText(text)
+
+    def _show_media_error(self, text, service_hint=""):
+        self.add_message("assistant", f"⚠️ {text}")
+        self.stage_status.setText(
+            {"video": "视频生成失败。", "voice": "语音任务失败。"}.get(service_hint, "多媒体任务失败。")
+        )
+
+    def _remove_media_thread(self, pair):
+        if pair in self.media_threads:
+            self.media_threads.remove(pair)
+
+    def _stop_media_threads(self):
+        """窗口关闭时收尾视频/语音线程（与图片线程同款 orphan 保留策略）。"""
+        for pair in list(getattr(self, "media_threads", [])):
+            thread = pair[0]
+            try:
+                thread.quit()
+            except Exception:
+                pass
+            try:
+                if not thread.wait(1500):
+                    self.media_threads.remove(pair)
+                    logger.warning(
+                        "多媒体线程未在 1.5s 内停止，已保留引用避免销毁。"
+                    )
+            except Exception:
+                pass
+
+    def _stop_image_gen_threads(self):
+        """窗口关闭时收尾图片生成线程（G9：不阻塞 UI 退出）。
+
+        有界等待 1.5s；若线程仍未停止（网络阻塞中），
+        从追踪列表移除以保留线程引用，避免 deleteLater 销毁
+        仍被 worker 引用中的 QThread（防止 worker 发信号到已析构线程）。
+        与 _stop_background_threads 的 orphan 策略一致。
+        """
+        for pair in list(getattr(self, "image_gen_threads", [])):
+            thread, worker = pair[0], pair[1]
+            try:
+                thread.quit()
+            except Exception:
+                pass
+            try:
+                if not thread.wait(1500):
+                    # 线程仍在运行（网络请求阻塞中）：保留引用，
+                    # 不 deleteLater，避免 use-after-free。
+                    self.image_gen_threads.remove(pair)
+                    logger.warning(
+                        "图片生成线程未在 1.5s 内停止，已保留引用避免销毁。"
+                    )
+            except Exception:
+                pass
 
     def add_video(
         self,
@@ -9857,6 +10857,18 @@ class AronaUI(QMainWindow):
 
         # V0.3 先停止桌面自主感知
         self._stop_desktop_awareness()
+
+        # R12.3-07 M3：收尾图片生成后台线程（G9）
+        try:
+            self._stop_image_gen_threads()
+        except Exception:
+            pass
+
+        # R13-MEDIA-01：收尾视频/语音后台线程（G9，同款 orphan 策略）
+        try:
+            self._stop_media_threads()
+        except Exception:
+            pass
 
         try:
 
